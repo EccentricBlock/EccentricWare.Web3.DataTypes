@@ -5,6 +5,9 @@ using System.Globalization;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json.Serialization;
+using EccentricWare.Web3.DataTypes.JsonConverters;
 
 namespace EccentricWare.Web3.DataTypes;
 
@@ -13,6 +16,7 @@ namespace EccentricWare.Web3.DataTypes;
 /// Optimised for Web3 workloads (EVM/Solana), including allocation-free parsing of hex/decimal and efficient comparisons.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
+[JsonConverter(typeof(Int256JsonConverter))]
 public readonly struct int256 :
     IEquatable<int256>,
     IComparable<int256>,
@@ -85,27 +89,35 @@ public readonly struct int256 :
     /// <param name="bigEndianTwosComplementBytes">Two's complement bytes in big-endian order.</param>
     public int256(ReadOnlySpan<byte> bigEndianTwosComplementBytes)
     {
+        if (bigEndianTwosComplementBytes.Length == 32)
+        {
+            _u3 = BinaryPrimitives.ReadUInt64BigEndian(bigEndianTwosComplementBytes);
+            _u2 = BinaryPrimitives.ReadUInt64BigEndian(bigEndianTwosComplementBytes.Slice(8));
+            _u1 = BinaryPrimitives.ReadUInt64BigEndian(bigEndianTwosComplementBytes.Slice(16));
+            _u0 = BinaryPrimitives.ReadUInt64BigEndian(bigEndianTwosComplementBytes.Slice(24));
+            return;
+        }
+
+        this = FromBigEndianSignExtended(bigEndianTwosComplementBytes);
+    }
+
+    // The padded path lives in a separate method so the common exact-32-byte path stays small. It reads limbs directly:
+    // a stackalloc buffer here costs about 3x more (measured), because it is no longer inlined into the caller.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int256 FromBigEndianSignExtended(ReadOnlySpan<byte> bigEndianTwosComplementBytes)
+    {
         if (bigEndianTwosComplementBytes.Length > 32)
             throw new ArgumentException("Expected at most 32 bytes.", nameof(bigEndianTwosComplementBytes));
 
-        Span<byte> padded = stackalloc byte[32];
+        // Sign extension based on the MSB of the first provided byte; empty input is zero.
+        ulong fill = bigEndianTwosComplementBytes.Length != 0 && (bigEndianTwosComplementBytes[0] & 0x80) != 0 ? ulong.MaxValue : 0UL;
 
-        if (bigEndianTwosComplementBytes.Length == 0)
-        {
-            padded.Clear();
-        }
-        else
-        {
-            // Sign extension based on MSB of first provided byte.
-            byte signFill = (bigEndianTwosComplementBytes[0] & 0x80) != 0 ? (byte)0xFF : (byte)0x00;
-            padded.Fill(signFill);
-            bigEndianTwosComplementBytes.CopyTo(padded.Slice(32 - bigEndianTwosComplementBytes.Length));
-        }
-
-        _u3 = BinaryPrimitives.ReadUInt64BigEndian(padded);
-        _u2 = BinaryPrimitives.ReadUInt64BigEndian(padded.Slice(8));
-        _u1 = BinaryPrimitives.ReadUInt64BigEndian(padded.Slice(16));
-        _u0 = BinaryPrimitives.ReadUInt64BigEndian(padded.Slice(24));
+        int end = bigEndianTwosComplementBytes.Length;
+        ulong u0 = LimbReader.TakeBigEndianTail(bigEndianTwosComplementBytes, ref end, fill);
+        ulong u1 = LimbReader.TakeBigEndianTail(bigEndianTwosComplementBytes, ref end, fill);
+        ulong u2 = LimbReader.TakeBigEndianTail(bigEndianTwosComplementBytes, ref end, fill);
+        ulong u3 = LimbReader.TakeBigEndianTail(bigEndianTwosComplementBytes, ref end, fill);
+        return new int256(u0, u1, u2, u3);
     }
 
     #endregion
@@ -138,6 +150,12 @@ public readonly struct int256 :
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => IsZero ? 0 : (IsNegative ? -1 : 1);
     }
+
+    /// <summary>Limb accessors for the internal arithmetic core (limb 0 is least significant).</summary>
+    internal ulong U0 { [MethodImpl(MethodImplOptions.AggressiveInlining)] get => _u0; }
+    internal ulong U1 { [MethodImpl(MethodImplOptions.AggressiveInlining)] get => _u1; }
+    internal ulong U2 { [MethodImpl(MethodImplOptions.AggressiveInlining)] get => _u2; }
+    internal ulong U3 { [MethodImpl(MethodImplOptions.AggressiveInlining)] get => _u3; }
 
     #endregion
 
@@ -215,28 +233,10 @@ public readonly struct int256 :
     public override bool Equals(object? obj) => obj is int256 other && Equals(other);
 
     /// <summary>
-    /// Computes a high-quality hash code suitable for large hash tables (millions of keys).
+    /// Computes a keyed hash code (random per process) suitable for large hash tables (millions of keys)
+    /// and for keys controlled by untrusted input.
     /// </summary>
-    public override int GetHashCode()
-    {
-        static ulong Mix(ulong x)
-        {
-            x ^= x >> 33;
-            x *= 0xff51afd7ed558ccdUL;
-            x ^= x >> 33;
-            x *= 0xc4ceb9fe1a85ec53UL;
-            x ^= x >> 33;
-            return x;
-        }
-
-        ulong h = 0x9e3779b97f4a7c15UL;
-        h = Mix(h ^ _u0);
-        h = Mix(h ^ _u1);
-        h = Mix(h ^ _u2);
-        h = Mix(h ^ _u3);
-
-        return (int)(h ^ (h >> 32));
-    }
+    public override int GetHashCode() => Hash256.Compute(_u0, _u1, _u2, _u3);
 
     /// <summary>
     /// Determines whether two values are equal.
@@ -417,30 +417,51 @@ public readonly struct int256 :
     }
 
     /// <summary>
-    /// Multiplies two values (cold-path BigInteger) and throws <see cref="OverflowException"/> if the result exceeds int256 range.
+    /// Multiplies two values and throws <see cref="OverflowException"/> if the result exceeds the int256 range.
+    /// Works on magnitudes with the allocation-free 256-bit core.
     /// </summary>
-    public static int256 operator *(int256 left, int256 right) => MultiplyCold(left, right);
+    public static int256 operator *(int256 left, int256 right)
+    {
+        uint256 a = left.Magnitude();
+        uint256 b = right.Magnitude();
+
+        if (!UInt256Math.TryMultiply(in a, in b, out uint256 product))
+            ThrowOverflow("int256 multiplication overflow.");
+
+        return FromMagnitude(in product, left.IsNegative != right.IsNegative, "int256 multiplication overflow.");
+    }
 
     /// <summary>
-    /// Divides two values (cold-path BigInteger) and throws <see cref="DivideByZeroException"/> if divisor is zero.
+    /// Divides two values, truncating toward zero (EVM SDIV). Throws <see cref="DivideByZeroException"/> if the divisor is
+    /// zero and <see cref="OverflowException"/> for <see cref="MinValue"/> / -1.
     /// </summary>
     public static int256 operator /(int256 left, int256 right)
     {
         if (right.IsZero)
             throw new DivideByZeroException();
 
-        return DivideCold(left, right);
+        uint256 a = left.Magnitude();
+        uint256 b = right.Magnitude();
+        UInt256Math.DivRem(in a, in b, out uint256 quotient, out _);
+
+        return FromMagnitude(in quotient, left.IsNegative != right.IsNegative, "int256 division overflow.");
     }
 
     /// <summary>
-    /// Computes left modulo right (cold-path BigInteger) and throws <see cref="DivideByZeroException"/> if divisor is zero.
+    /// Computes left modulo right; the result takes the sign of the dividend (EVM SMOD).
+    /// Throws <see cref="DivideByZeroException"/> if the divisor is zero.
     /// </summary>
     public static int256 operator %(int256 left, int256 right)
     {
         if (right.IsZero)
             throw new DivideByZeroException();
 
-        return ModuloCold(left, right);
+        uint256 a = left.Magnitude();
+        uint256 b = right.Magnitude();
+        UInt256Math.DivRem(in a, in b, out _, out uint256 remainder);
+
+        // |remainder| < |divisor| <= 2^255, so it always fits.
+        return FromMagnitude(in remainder, left.IsNegative, "int256 remainder overflow.");
     }
 
     #endregion
@@ -468,12 +489,14 @@ public readonly struct int256 :
         => new int256(~value._u0, ~value._u1, ~value._u2, ~value._u3);
 
     /// <summary>
-    /// Shifts the value left by a specified number of bits (logical shift).
+    /// Shifts the value left by a specified number of bits (logical shift; the shifted-out bits are discarded).
+    /// Counts of 256 or more yield zero (as in <see cref="uint256"/> and the EVM SHL); a negative count throws
+    /// <see cref="ArgumentOutOfRangeException"/>.
     /// </summary>
     public static int256 operator <<(int256 value, int shift)
     {
-        shift &= 255;
         if (shift == 0) return value;
+        if (shift < 0) throw new ArgumentOutOfRangeException(nameof(shift), "Shift count must be non-negative.");
         if (shift >= 256) return Zero;
 
         int wholeLimbs = shift >> 6;
@@ -523,11 +546,13 @@ public readonly struct int256 :
 
     /// <summary>
     /// Shifts the value right by a specified number of bits (arithmetic shift with sign extension).
+    /// Counts of 256 or more shift out every bit: the result is zero for non-negative values and -1 for negative ones
+    /// (the same as shifting by 255, and the EVM SAR). A negative count throws <see cref="ArgumentOutOfRangeException"/>.
     /// </summary>
     public static int256 operator >>(int256 value, int shift)
     {
-        shift &= 255;
         if (shift == 0) return value;
+        if (shift < 0) throw new ArgumentOutOfRangeException(nameof(shift), "Shift count must be non-negative.");
 
         if (shift >= 256)
             return value.IsNegative ? MinusOne : Zero;
@@ -589,21 +614,14 @@ public readonly struct int256 :
     /// <summary>Explicit conversion to <see cref="long"/> (throws if out of range).</summary>
     public static explicit operator long(int256 value)
     {
-        if (value.IsNegative)
-        {
-            // Must fit in signed 64-bit. Sign extension for limbs must be all 1s and top bits must match.
-            if (value._u3 != ulong.MaxValue || value._u2 != ulong.MaxValue || value._u1 != ulong.MaxValue)
-                throw new OverflowException("Value is out of range for long.");
+        // Fits in signed 64-bit only if limbs 1..3 are the sign extension of bit 63 of limb 0.
+        long low = unchecked((long)value._u0);
+        ulong signExtension = (ulong)(low >> 63); // all ones if low is negative, otherwise zero
 
-            return unchecked((long)value._u0);
-        }
-        else
-        {
-            if (value._u3 != 0 || value._u2 != 0 || value._u1 != 0)
-                throw new OverflowException("Value is out of range for long.");
+        if (value._u1 != signExtension || value._u2 != signExtension || value._u3 != signExtension)
+            throw new OverflowException("Value is out of range for long.");
 
-            return unchecked((long)value._u0);
-        }
+        return low;
     }
 
     /// <summary>
@@ -649,10 +667,15 @@ public readonly struct int256 :
     /// <summary>
     /// Parses a string into an <see cref="int256"/> using the provided format provider.
     /// Supports:
-    /// - Hex with optional "0x" prefix (two's complement if 64 hex digits; otherwise treated as positive magnitude)
+    /// - Hex with a required "0x" prefix (two's complement if 64 hex digits; otherwise treated as positive magnitude); bare hex
+    ///   digits are read as decimal, so a bare "10" is ten, not sixteen
     /// - Decimal with optional leading '-' sign
     /// </summary>
-    public static int256 Parse(string s, IFormatProvider? provider) => Parse(s.AsSpan(), provider);
+    public static int256 Parse(string s, IFormatProvider? provider)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        return Parse(s.AsSpan(), provider);
+    }
 
     /// <summary>
     /// Parses a span into an <see cref="int256"/> using the provided format provider.
@@ -668,7 +691,11 @@ public readonly struct int256 :
     /// <summary>
     /// Parses a string into an <see cref="int256"/> using invariant culture.
     /// </summary>
-    public static int256 Parse(string s) => Parse(s.AsSpan(), CultureInfo.InvariantCulture);
+    public static int256 Parse(string s)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        return Parse(s.AsSpan(), CultureInfo.InvariantCulture);
+    }
 
     /// <summary>
     /// Parses a span into an <see cref="int256"/> using invariant culture.
@@ -799,16 +826,24 @@ public readonly struct int256 :
     /// </summary>
     public static bool TryParse(ReadOnlySpan<byte> utf8, out int256 value)
     {
-        value = Zero;
-
         utf8 = ByteUtils.TrimAsciiWhitespaceUtf8(utf8);
 
         // Optional surrounding quotes.
         if (utf8.Length >= 2 && utf8[0] == (byte)'"' && utf8[^1] == (byte)'"')
-        {
             utf8 = utf8.Slice(1, utf8.Length - 2);
-            utf8 = ByteUtils.TrimAsciiWhitespaceUtf8(utf8);
-        }
+
+        return TryParseUnquoted(utf8, out value);
+    }
+
+    /// <summary>
+    /// Parses UTF-8 hex or signed decimal text without accepting surrounding quotes. Used by the JSON converter,
+    /// whose string tokens are already unquoted, so a quote character inside the value must stay invalid.
+    /// </summary>
+    internal static bool TryParseUnquoted(ReadOnlySpan<byte> utf8, out int256 value)
+    {
+        value = Zero;
+
+        utf8 = ByteUtils.TrimAsciiWhitespaceUtf8(utf8);
 
         if (utf8.Length == 0)
             return false;
@@ -922,7 +957,7 @@ public readonly struct int256 :
         if (!ByteUtils.TryTrimLeadingSign(s, out bool isNegativePrefix, out ReadOnlySpan<char> unsignedSpan))
             return false;
 
-        unsignedSpan = ByteUtils.TrimWhitespace(unsignedSpan);
+        // No whitespace is allowed between the sign and the digits ("- 5" is invalid, as it is for TryParse).
         if (unsignedSpan.Length == 0)
             return false;
 
@@ -964,157 +999,75 @@ public readonly struct int256 :
 
     /// <summary>
     /// Formats the value as a string using:
-    /// - "D" / "d": signed decimal (cold-path BigInteger conversion)
-    /// - "0x" / "0X": hex with prefix (positive: minimal magnitude, negative: full 64-digit two's complement)
-    /// - "x" / "X": hex without prefix (positive: minimal magnitude, negative: full 64-digit two's complement)
+    /// - "D" / "d" (default): signed decimal
+    /// - "0x" / "0X": hex with a lowercase "0x" prefix (positive: minimal magnitude, negative: full 64-digit two's complement)
+    /// - "x" / "X": hex without prefix (same digit rules)
+    /// Null or empty selects the default. Throws <see cref="FormatException"/> for any other format.
     /// </summary>
     public string ToString(string? format, IFormatProvider? formatProvider)
     {
-        format ??= "D";
-
-        Span<char> buffer = stackalloc char[80];
-        if (!TryFormat(buffer, out int written, format.AsSpan(), formatProvider))
-            throw new FormatException($"Unable to format int256 using format '{format}'.");
-
-        return new string(buffer.Slice(0, written));
+        AsciiBuffer80 storage = default;
+        return UInt256Formatting.CreateString(FormatAscii(storage, format.AsSpan()));
     }
 
     /// <summary>
     /// Attempts to format the value into the destination character span.
+    /// Supported formats: "D"/"d" (default), "0x"/"0X" (the prefix is always lowercase), "x", "X".
+    /// Returns false only when <paramref name="destination"/> is too small; throws <see cref="FormatException"/> for any
+    /// other format (callers such as string interpolation retry with a larger buffer whenever false is returned).
+    /// Output does not depend on <paramref name="provider"/>: it must round-trip through <c>Parse</c>, and
+    /// culture-specific negative signs can be non-ASCII.
     /// </summary>
     public bool TryFormat(Span<char> destination, out int charsWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        charsWritten = 0;
+        AsciiBuffer80 storage = default;
+        ReadOnlySpan<byte> ascii = FormatAscii(storage, format);
 
-        if (format.Length == 0)
-            format = "D".AsSpan();
-
-        bool decimalFormat = format.Length == 1 && (format[0] == 'd' || format[0] == 'D');
-        if (decimalFormat)
+        if (ascii.Length > destination.Length)
         {
-            // Cold path: decimal formatting uses BigInteger conversion.
-            return ToBigInteger().TryFormat(destination, out charsWritten, default, provider);
-        }
-
-        bool withPrefix = format.Length == 2 && format[0] == '0' && (format[1] == 'x' || format[1] == 'X');
-        bool uppercase = (format.Length == 1 && format[0] == 'X') || (format.Length == 2 && format[1] == 'X');
-        bool hexNoPrefixLower = format.Length == 1 && format[0] == 'x';
-        bool hexNoPrefixUpper = format.Length == 1 && format[0] == 'X';
-
-        if (!(withPrefix || hexNoPrefixLower || hexNoPrefixUpper))
+            charsWritten = 0;
             return false;
-
-        int pos = 0;
-        if (withPrefix)
-        {
-            if (destination.Length < 2)
-                return false;
-
-            destination[pos++] = '0';
-            destination[pos++] = uppercase ? 'X' : 'x';
         }
 
-        if (IsNegative)
-        {
-            // Negative hex is emitted as full-width two's complement to avoid ambiguity.
-            if (destination.Length - pos < 64)
-                return false;
-
-            ByteUtils.WriteHexUInt64(destination.Slice(pos + 0, 16), _u3, uppercase);
-            ByteUtils.WriteHexUInt64(destination.Slice(pos + 16, 16), _u2, uppercase);
-            ByteUtils.WriteHexUInt64(destination.Slice(pos + 32, 16), _u1, uppercase);
-            ByteUtils.WriteHexUInt64(destination.Slice(pos + 48, 16), _u0, uppercase);
-
-            charsWritten = pos + 64;
-            return true;
-        }
-
-        // Positive: minimal hex, grouped by limbs like uint256.
-        ReadOnlySpan<char> fmtVar = uppercase ? "X" : "x";
-        ReadOnlySpan<char> fmt16 = uppercase ? "X16" : "x16";
-
-        if (_u3 == 0 && _u2 == 0 && _u1 == 0)
-        {
-            if (!_u0.TryFormat(destination.Slice(pos), out int w0, fmtVar, provider))
-                return false;
-
-            charsWritten = pos + w0;
-            return true;
-        }
-
-        if (_u3 == 0 && _u2 == 0)
-        {
-            if (!_u1.TryFormat(destination.Slice(pos), out int w1, fmtVar, provider))
-                return false;
-            pos += w1;
-
-            if (!_u0.TryFormat(destination.Slice(pos), out int w0, fmt16, provider))
-                return false;
-
-            charsWritten = pos + w0;
-            return true;
-        }
-
-        if (_u3 == 0)
-        {
-            if (!_u2.TryFormat(destination.Slice(pos), out int w2, fmtVar, provider))
-                return false;
-            pos += w2;
-
-            if (!_u1.TryFormat(destination.Slice(pos), out int w1, fmt16, provider))
-                return false;
-            pos += w1;
-
-            if (!_u0.TryFormat(destination.Slice(pos), out int w0, fmt16, provider))
-                return false;
-
-            charsWritten = pos + w0;
-            return true;
-        }
-
-        if (!_u3.TryFormat(destination.Slice(pos), out int w3, fmtVar, provider))
-            return false;
-        pos += w3;
-
-        if (!_u2.TryFormat(destination.Slice(pos), out int w2f, fmt16, provider))
-            return false;
-        pos += w2f;
-
-        if (!_u1.TryFormat(destination.Slice(pos), out int w1f, fmt16, provider))
-            return false;
-        pos += w1f;
-
-        if (!_u0.TryFormat(destination.Slice(pos), out int w0f, fmt16, provider))
-            return false;
-
-        charsWritten = pos + w0f;
+        Ascii.ToUtf16(ascii, destination, out charsWritten);
         return true;
     }
 
     /// <summary>
-    /// Attempts to format the value into a UTF-8 destination span.
-    /// Output is ASCII-compatible for supported formats.
+    /// Attempts to format the value into a UTF-8 destination span (the output is plain ASCII).
+    /// Returns false only when the destination is too small; throws <see cref="FormatException"/> for unknown formats.
     /// </summary>
     public bool TryFormat(Span<byte> utf8Destination, out int bytesWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        Span<char> buffer = stackalloc char[80];
-        if (!TryFormat(buffer, out int charsWritten, format, provider))
+        AsciiBuffer80 storage = default;
+        ReadOnlySpan<byte> ascii = FormatAscii(storage, format);
+
+        if (ascii.Length > utf8Destination.Length)
         {
             bytesWritten = 0;
             return false;
         }
 
-        if (charsWritten > utf8Destination.Length)
-        {
-            bytesWritten = 0;
-            return false;
-        }
-
-        for (int i = 0; i < charsWritten; i++)
-            utf8Destination[i] = (byte)buffer[i];
-
-        bytesWritten = charsWritten;
+        ascii.CopyTo(utf8Destination);
+        bytesWritten = ascii.Length;
         return true;
+    }
+
+    private ReadOnlySpan<byte> FormatAscii(Span<byte> scratch, ReadOnlySpan<char> format)
+    {
+        if (format.Length == 0 || (format.Length == 1 && (format[0] == 'd' || format[0] == 'D')))
+        {
+            if (!IsNegative)
+                return UInt256Formatting.FormatDecimal(scratch, _u0, _u1, _u2, _u3, negative: false);
+
+            ByteUtils.NegateTwosComplement256(_u0, _u1, _u2, _u3, out ulong m0, out ulong m1, out ulong m2, out ulong m3);
+            return UInt256Formatting.FormatDecimal(scratch, m0, m1, m2, m3, negative: true);
+        }
+
+        HexFormat.Parse(format, out bool withPrefix, out bool uppercase);
+
+        // Negative hex is full-width two's complement to avoid ambiguity; positive hex is the minimal magnitude.
+        return UInt256Formatting.FormatHex(scratch, _u0, _u1, _u2, _u3, withPrefix, uppercase, fullWidth: IsNegative);
     }
 
     #endregion
@@ -1140,26 +1093,43 @@ public readonly struct int256 :
         return (u2 | u1 | u0) == 0;
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static int256 MultiplyCold(int256 left, int256 right)
+    /// <summary>Absolute value as an unsigned 256-bit value (<see cref="MinValue"/> maps to 2^255).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private uint256 Magnitude()
     {
-        BigInteger r = (BigInteger)left * (BigInteger)right;
-        return (int256)r;
+        if (!IsNegative)
+            return new uint256(_u0, _u1, _u2, _u3);
+
+        int256 negated = NegateUnchecked(this);
+        return new uint256(negated._u0, negated._u1, negated._u2, negated._u3);
+    }
+
+    /// <summary>
+    /// Builds a signed value from a magnitude and sign, throwing <see cref="OverflowException"/> when it is out of range
+    /// (magnitude above 2^255 - 1 for positive results, above 2^255 for negative results).
+    /// </summary>
+    private static int256 FromMagnitude(in uint256 magnitude, bool negative, string overflowMessage)
+    {
+        const ulong SignBit = 0x8000_0000_0000_0000UL;
+        ulong top = magnitude.U3;
+
+        if (negative)
+        {
+            if (top > SignBit || (top == SignBit && (magnitude.U2 | magnitude.U1 | magnitude.U0) != 0))
+                ThrowOverflow(overflowMessage);
+
+            // Negating 2^255 yields the same bit pattern, which is MinValue.
+            return NegateUnchecked(new int256(magnitude.U0, magnitude.U1, magnitude.U2, top));
+        }
+
+        if ((top & SignBit) != 0)
+            ThrowOverflow(overflowMessage);
+
+        return new int256(magnitude.U0, magnitude.U1, magnitude.U2, top);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static int256 DivideCold(int256 left, int256 right)
-    {
-        BigInteger q = (BigInteger)left / (BigInteger)right;
-        return (int256)q;
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static int256 ModuloCold(int256 left, int256 right)
-    {
-        BigInteger r = (BigInteger)left % (BigInteger)right;
-        return (int256)r;
-    }
+    private static void ThrowOverflow(string message) => throw new OverflowException(message);
 
     private static bool TryConvertPositiveBigInteger(BigInteger value, out int256 result)
     {

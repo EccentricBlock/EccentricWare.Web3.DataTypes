@@ -48,7 +48,7 @@ public static class UInt256BulkSimd
 
     /// <summary>
     /// Writes matching indices for <paramref name="needle"/> into <paramref name="destinationIndices"/> and returns how many were written.
-    /// Scans the full span; stops writing when the destination is full.
+    /// Scans the span only until the destination is full: it stops as soon as the last slot has been filled.
     /// Uses AVX2 when supported.
     /// </summary>
     /// <param name="haystack">The values to scan.</param>

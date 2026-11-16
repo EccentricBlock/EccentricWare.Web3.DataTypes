@@ -136,11 +136,22 @@ public readonly struct HexBytes :
     /// <summary>
     /// Gets the number of hex characters required to represent the bytes (no prefix).
     /// </summary>
+    /// <exception cref="OverflowException">The value has 2^30 bytes or more, so the count does not fit an <see cref="int"/>.</exception>
     public int HexLength
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => Length << 1;
+        get => checked(Length * 2);
     }
+
+    /// <summary>Characters needed for the hex text, computed in 64 bits so values of 2^30 bytes or more do not wrap.</summary>
+    private long FormattedLength(bool withPrefix) => (2L * Length) + (withPrefix ? 2 : 0);
+
+    /// <summary>
+    /// The string length for <paramref name="length"/> characters, clamped to <see cref="int.MaxValue"/>:
+    /// <see cref="string.Create{TState}"/> then fails with the runtime's own <see cref="OutOfMemoryException"/> instead of the
+    /// length wrapping negative.
+    /// </summary>
+    private static int StringLengthOrThrow(long length) => length <= int.MaxValue ? (int)length : int.MaxValue;
 
     #endregion
 
@@ -195,10 +206,11 @@ public readonly struct HexBytes :
 
     /// <summary>
     /// Returns a new <see cref="HexBytes"/> containing a copied slice of the current bytes.
+    /// Throws <see cref="ArgumentOutOfRangeException"/> when out of range, including for <see cref="Empty"/>.
     /// </summary>
     /// <param name="start">Start index.</param>
     public HexBytes Slice(int start)
-        => _bytes is null ? Empty : new HexBytes(_bytes.AsSpan(start));
+        => new(Span.Slice(start));
 
     /// <summary>
     /// Returns a new <see cref="HexBytes"/> containing a copied slice of the current bytes.
@@ -206,7 +218,7 @@ public readonly struct HexBytes :
     /// <param name="start">Start index.</param>
     /// <param name="length">Slice length.</param>
     public HexBytes Slice(int start, int length)
-        => _bytes is null ? Empty : new HexBytes(_bytes.AsSpan(start, length));
+        => new(Span.Slice(start, length));
 
     /// <summary>
     /// Concatenates two values into a newly allocated byte array.
@@ -241,9 +253,20 @@ public readonly struct HexBytes :
     public override bool Equals(object? obj) => obj is HexBytes other && Equals(other);
 
     /// <summary>
-    /// Hashes the value using a constant-time sample of length + head + tail.
-    /// This reduces collisions compared to hashing only a prefix.
+    /// Payloads up to this length are hashed in full; longer ones hash the first and last
+    /// <c>MaxFullHashBytes / 2</c> bytes plus the length.
     /// </summary>
+    internal const int MaxFullHashBytes = 4096;
+
+    /// <summary>
+    /// Hashes the length and the content (randomised per process via <see cref="HashCode"/>).
+    /// </summary>
+    /// <remarks>
+    /// Sampling only the head and tail collapses common calldata (for example <c>approve(spender, MAX)</c>,
+    /// where only the middle differs) onto one hash code, turning dictionary lookups into linear scans.
+    /// shortcut: payloads above <see cref="MaxFullHashBytes"/> hash head + tail only, so large values that differ solely
+    /// in the middle collide; upgrade to a full vectorised hash (e.g. XxHash3) if such keys appear in practice.
+    /// </remarks>
     public override int GetHashCode()
     {
         var s = Span;
@@ -252,9 +275,15 @@ public readonly struct HexBytes :
         var hash = new HashCode();
         hash.Add(s.Length);
 
-        // Sample head and tail to improve distribution with common prefixes.
-        hash.Add(ByteUtils.SampleUInt64LittleEndian(s, 0));
-        hash.Add(ByteUtils.SampleUInt64LittleEndian(s, Math.Max(0, s.Length - 8)));
+        if (s.Length <= MaxFullHashBytes)
+        {
+            hash.AddBytes(s);
+        }
+        else
+        {
+            hash.AddBytes(s.Slice(0, MaxFullHashBytes / 2));
+            hash.AddBytes(s.Slice(s.Length - (MaxFullHashBytes / 2)));
+        }
 
         return hash.ToHashCode();
     }
@@ -322,10 +351,16 @@ public readonly struct HexBytes :
     /// <summary>
     /// Parses a hex string into a value.
     /// </summary>
-    public static HexBytes Parse(string hex) => Parse(hex.AsSpan());
+    public static HexBytes Parse(string hex)
+    {
+        ArgumentNullException.ThrowIfNull(hex);
+        return Parse(hex.AsSpan());
+    }
 
     /// <summary>
     /// Tries to parse a hex string (with optional 0x prefix) without throwing.
+    /// Leading/trailing ASCII whitespace and one pair of surrounding double quotes are accepted, exactly as in
+    /// <see cref="TryParse(ReadOnlySpan{byte}, out HexBytes)"/>.
     /// Accepts odd-length hex by treating it as if left-padded with a single '0'.
     /// </summary>
     /// <param name="hex">Hex characters.</param>
@@ -337,6 +372,10 @@ public readonly struct HexBytes :
         if (hex.IsEmpty)
             return true;
 
+        hex = ByteUtils.TrimAsciiWhitespace(hex);
+        if (hex.Length >= 2 && hex[0] == '"' && hex[^1] == '"')
+            hex = hex.Slice(1, hex.Length - 2);
+
         if (ByteUtils.TryTrimHexPrefix(hex, out var digits))
             hex = digits;
 
@@ -345,6 +384,10 @@ public readonly struct HexBytes :
 
         int byteCount = ByteUtils.GetHexDecodedByteCount(hex.Length, allowOddLength: true);
         if (byteCount < 0)
+            return false;
+
+        // Validate first: invalid text must not cost a result-sized allocation (the UTF-8 paths already work this way).
+        if (!ByteUtils.IsAllHexChars(hex))
             return false;
 
         var bytes = new byte[byteCount];
@@ -371,6 +414,119 @@ public readonly struct HexBytes :
         utf8 = ByteUtils.TrimAsciiWhitespaceUtf8(utf8);
         utf8 = ByteUtils.UnquoteJsonStringUtf8(utf8);
 
+        return TryParseDigits(utf8, out value);
+    }
+
+    /// <summary>
+    /// Parses the text of a JSON string token (quotes already removed by the reader): ASCII whitespace around the value is
+    /// ignored, but unlike <see cref="TryParse(ReadOnlySpan{byte}, out HexBytes)"/> a quote character is content, not
+    /// framing, so it is rejected. Used by the JSON converter.
+    /// </summary>
+    internal static bool TryParseUnquoted(ReadOnlySpan<byte> utf8, out HexBytes value)
+        => TryParseDigits(ByteUtils.TrimAsciiWhitespaceUtf8(utf8), out value);
+
+    private static readonly SearchValues<byte> s_asciiWhitespace = SearchValues.Create(" \t\r\n"u8);
+
+    /// <summary>
+    /// <see cref="TryParseUnquoted(ReadOnlySpan{byte}, out HexBytes)"/> for text split across
+    /// <see cref="ReadOnlySequence{T}"/> segments. The text is validated and then decoded segment by segment straight
+    /// into the result array, so nothing proportional to the text is copied or pooled.
+    /// </summary>
+    internal static bool TryParseUnquoted(ReadOnlySequence<byte> utf8, out HexBytes value)
+    {
+        value = Empty;
+
+        // Locate the first and last byte that is not ASCII whitespace.
+        long first = -1, last = -1, offset = 0;
+        foreach (ReadOnlyMemory<byte> segment in utf8)
+        {
+            ReadOnlySpan<byte> span = segment.Span;
+            int lo = span.IndexOfAnyExcept(s_asciiWhitespace);
+            if (lo >= 0)
+            {
+                if (first < 0)
+                    first = offset + lo;
+
+                last = offset + span.LastIndexOfAnyExcept(s_asciiWhitespace);
+            }
+
+            offset += span.Length;
+        }
+
+        if (first < 0)
+            return true;
+
+        ReadOnlySequence<byte> digits = utf8.Slice(first, last - first + 1);
+
+        if (digits.Length >= 2)
+        {
+            Span<byte> head = stackalloc byte[2];
+            digits.Slice(0, 2).CopyTo(head);
+            if (head[0] == (byte)'0' && (head[1] | 0x20) == (byte)'x')
+                digits = digits.Slice(2);
+        }
+
+        if (digits.IsEmpty)
+            return true;
+
+        long byteCount = (digits.Length + 1) >> 1;
+        if (byteCount > Array.MaxLength)
+            return false;
+
+        // Validate first: an invalid token must not cost a result-sized allocation.
+        foreach (ReadOnlyMemory<byte> segment in digits)
+        {
+            if (!ByteUtils.IsAllHexUtf8(segment.Span))
+                return false;
+        }
+
+        var bytes = new byte[byteCount];
+        int dst = 0;
+
+        // A pair of digits can straddle a segment boundary, so the unpaired high digit is carried to the next segment.
+        // An odd digit count is left-padded with a '0', which is just a carried high digit that starts as '0'.
+        int pendingHigh = (digits.Length & 1) != 0 ? '0' : -1;
+
+        foreach (ReadOnlyMemory<byte> segment in digits)
+        {
+            ReadOnlySpan<byte> span = segment.Span;
+            if (span.IsEmpty)
+                continue;
+
+            if (pendingHigh >= 0)
+            {
+                bytes[dst++] = (byte)((ByteUtils.ParseHexNibbleUtf8((byte)pendingHigh) << 4) | ByteUtils.ParseHexNibbleUtf8(span[0]));
+                span = span.Slice(1);
+                pendingHigh = -1;
+            }
+
+            if ((span.Length & 1) != 0)
+            {
+                pendingHigh = span[^1];
+                span = span.Slice(0, span.Length - 1);
+            }
+
+            if (!span.IsEmpty)
+            {
+                if (!ByteUtils.TryDecodeHexUtf8(span, bytes.AsSpan(dst), out int written, allowOddLength: false))
+                    return false;
+
+                dst += written;
+            }
+        }
+
+        if (dst != bytes.Length || pendingHigh >= 0)
+            return false;
+
+        value = FromArrayUnsafe(bytes);
+        return true;
+    }
+
+    /// <summary>Parses optionally 0x-prefixed hex digits (odd length allowed); empty text is the empty value.</summary>
+    private static bool TryParseDigits(ReadOnlySpan<byte> utf8, out HexBytes value)
+    {
+        value = Empty;
+
         if (utf8.IsEmpty)
             return true;
 
@@ -382,6 +538,10 @@ public readonly struct HexBytes :
 
         int byteCount = ByteUtils.GetHexDecodedByteCount(utf8.Length, allowOddLength: true);
         if (byteCount < 0)
+            return false;
+
+        // Validate first: an invalid token must not cost a result-sized allocation.
+        if (!ByteUtils.IsAllHexUtf8(utf8))
             return false;
 
         var bytes = new byte[byteCount];
@@ -404,7 +564,7 @@ public readonly struct HexBytes :
         if (IsEmpty)
             return "0x";
 
-        int requiredChars = HexLength + 2;
+        int requiredChars = StringLengthOrThrow(FormattedLength(withPrefix: true));
         return string.Create(requiredChars, this, static (destination, state) =>
         {
             destination[0] = '0';
@@ -415,23 +575,20 @@ public readonly struct HexBytes :
     }
 
     /// <summary>
-    /// Formats the value using the following formats:
-    /// - "" or "0x": 0x-prefixed lowercase
+    /// Formats the value using the following formats (any other format throws <see cref="FormatException"/>):
+    /// - null, "" or "0x": 0x-prefixed lowercase
     /// - "x": unprefixed lowercase
     /// - "0X": 0x-prefixed uppercase
     /// - "X": unprefixed uppercase
     /// </summary>
     public string ToString(string? format, IFormatProvider? formatProvider = null)
     {
-        format ??= "0x";
-
-        bool withPrefix = format.Length == 0 || format == "0x" || format == "0X";
-        bool uppercase = format == "X" || format == "0X";
+        HexFormat.Parse(format, out bool withPrefix, out bool uppercase);
 
         if (IsEmpty)
             return withPrefix ? "0x" : string.Empty;
 
-        int requiredChars = HexLength + (withPrefix ? 2 : 0);
+        int requiredChars = StringLengthOrThrow(FormattedLength(withPrefix));
 
         return string.Create(requiredChars, (this, withPrefix, uppercase), static (destination, state) =>
         {
@@ -453,10 +610,9 @@ public readonly struct HexBytes :
     /// </summary>
     public bool TryFormat(Span<char> destination, out int charsWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        bool withPrefix = format.Length == 0 || format.SequenceEqual("0x") || format.SequenceEqual("0X");
-        bool uppercase = format.SequenceEqual("X") || format.SequenceEqual("0X");
+        HexFormat.Parse(format, out bool withPrefix, out bool uppercase);
 
-        int required = HexLength + (withPrefix ? 2 : 0);
+        long required = FormattedLength(withPrefix);
         if (destination.Length < required)
         {
             charsWritten = 0;
@@ -477,7 +633,7 @@ public readonly struct HexBytes :
             return false;
         }
 
-        charsWritten = required;
+        charsWritten = (int)required; // fits: it was no larger than the destination
         return true;
     }
 
@@ -486,10 +642,9 @@ public readonly struct HexBytes :
     /// </summary>
     public bool TryFormat(Span<byte> utf8Destination, out int bytesWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        bool withPrefix = format.Length == 0 || format.SequenceEqual("0x") || format.SequenceEqual("0X");
-        bool uppercase = format.SequenceEqual("X") || format.SequenceEqual("0X");
+        HexFormat.Parse(format, out bool withPrefix, out bool uppercase);
 
-        int required = HexLength + (withPrefix ? 2 : 0);
+        long required = FormattedLength(withPrefix);
         if (utf8Destination.Length < required)
         {
             bytesWritten = 0;
@@ -510,7 +665,7 @@ public readonly struct HexBytes :
             return false;
         }
 
-        bytesWritten = required;
+        bytesWritten = (int)required; // fits: it was no larger than the destination
         return true;
     }
 

@@ -45,8 +45,6 @@ public static class ByteUtils
     /// <summary>Uppercase hex alphabet for UTF-8 formatting.</summary>
     public static ReadOnlySpan<byte> HexBytesUpper => "0123456789ABCDEF"u8;
 
-    private static ReadOnlySpan<byte> Base58Alphabet => "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"u8;
-
     /// <summary>
     /// Returns 10^exponent for exponent in the range 0..19.
     /// </summary>
@@ -191,32 +189,7 @@ public static class ByteUtils
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool TryParseHexUInt32Utf8Fixed8(ReadOnlySpan<byte> hex8Utf8, out uint value)
     {
-        if (hex8Utf8.Length != 8)
-        {
-            value = 0;
-            return false;
-        }
-
-        int n0 = ParseHexNibbleUtf8(hex8Utf8[0]);
-        int n1 = ParseHexNibbleUtf8(hex8Utf8[1]);
-        int n2 = ParseHexNibbleUtf8(hex8Utf8[2]);
-        int n3 = ParseHexNibbleUtf8(hex8Utf8[3]);
-        int n4 = ParseHexNibbleUtf8(hex8Utf8[4]);
-        int n5 = ParseHexNibbleUtf8(hex8Utf8[5]);
-        int n6 = ParseHexNibbleUtf8(hex8Utf8[6]);
-        int n7 = ParseHexNibbleUtf8(hex8Utf8[7]);
-
-        if ((n0 | n1 | n2 | n3 | n4 | n5 | n6 | n7) < 0)
-        {
-            value = 0;
-            return false;
-        }
-
-        value =
-            ((uint)n0 << 28) | ((uint)n1 << 24) | ((uint)n2 << 20) | ((uint)n3 << 16) |
-            ((uint)n4 << 12) | ((uint)n5 << 8) | ((uint)n6 << 4) | (uint)n7;
-
-        return true;
+        return HexCodec.TryDecode8(hex8Utf8, out value);
     }
 
     /// <summary>
@@ -226,32 +199,7 @@ public static class ByteUtils
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool TryParseHexUInt32CharsFixed8(ReadOnlySpan<char> hex8, out uint value)
     {
-        if (hex8.Length != 8)
-        {
-            value = 0;
-            return false;
-        }
-
-        int n0 = ParseHexNibble(hex8[0]);
-        int n1 = ParseHexNibble(hex8[1]);
-        int n2 = ParseHexNibble(hex8[2]);
-        int n3 = ParseHexNibble(hex8[3]);
-        int n4 = ParseHexNibble(hex8[4]);
-        int n5 = ParseHexNibble(hex8[5]);
-        int n6 = ParseHexNibble(hex8[6]);
-        int n7 = ParseHexNibble(hex8[7]);
-
-        if ((n0 | n1 | n2 | n3 | n4 | n5 | n6 | n7) < 0)
-        {
-            value = 0;
-            return false;
-        }
-
-        value =
-            ((uint)n0 << 28) | ((uint)n1 << 24) | ((uint)n2 << 20) | ((uint)n3 << 16) |
-            ((uint)n4 << 12) | ((uint)n5 << 8) | ((uint)n6 << 4) | (uint)n7;
-
-        return true;
+        return HexCodec.TryDecode8(hex8, out value);
     }
 
     /// <summary>
@@ -270,7 +218,10 @@ public static class ByteUtils
         {
             int nibble = ParseHexNibbleUtf8(hexDigitsUtf8[i]);
             if (nibble < 0)
+            {
+                value = 0;
                 return false;
+            }
 
             value = (value << 4) | (uint)nibble;
         }
@@ -289,13 +240,7 @@ public static class ByteUtils
         if (destination8.Length != 8)
             ThrowHelper.ThrowArgumentExceptionFixedSize(nameof(destination8), 8);
 
-        ReadOnlySpan<char> alphabet = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
-
-        for (int i = 7; i >= 0; i--)
-        {
-            destination8[i] = alphabet[(int)(value & 0xFu)];
-            value >>= 4;
-        }
+        HexCodec.Encode8(destination8, value, uppercase);
     }
 
     /// <summary>
@@ -309,13 +254,7 @@ public static class ByteUtils
         if (destination8.Length != 8)
             ThrowHelper.ThrowArgumentExceptionFixedSize(nameof(destination8), 8);
 
-        ReadOnlySpan<byte> alphabet = uppercase ? HexBytesUpper : HexBytesLower;
-
-        for (int i = 7; i >= 0; i--)
-        {
-            destination8[i] = alphabet[(int)(value & 0xFu)];
-            value >>= 4;
-        }
+        HexCodec.Encode8(destination8, value, uppercase);
     }
 
     /// <summary>
@@ -331,7 +270,7 @@ public static class ByteUtils
         for (int i = 0; i < len; i++)
         {
             int nibble = ParseHexNibbleUtf8(hexDigits[i]);
-            if (nibble < 0) return false;
+            if (nibble < 0) { value = 0; return false; }
             value = (value << 4) | (uint)nibble;
         }
 
@@ -351,7 +290,7 @@ public static class ByteUtils
         for (int i = 0; i < len; i++)
         {
             int nibble = ParseHexNibble(hexDigits[i]);
-            if (nibble < 0) return false;
+            if (nibble < 0) { value = 0; return false; }
             value = (value << 4) | (uint)nibble;
         }
 
@@ -364,26 +303,7 @@ public static class ByteUtils
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool TryParseHexUInt64CharsFixed16(ReadOnlySpan<char> hex16, out ulong value)
     {
-        if (hex16.Length != 16)
-        {
-            value = 0;
-            return false;
-        }
-
-        ulong v = 0;
-        for (int i = 0; i < 16; i++)
-        {
-            int n = ParseHexNibble(hex16[i]);
-            if (n < 0)
-            {
-                value = 0;
-                return false;
-            }
-            v = (v << 4) | (uint)n;
-        }
-
-        value = v;
-        return true;
+        return HexCodec.TryDecode16(hex16, out value);
     }
 
     /// <summary>
@@ -392,26 +312,7 @@ public static class ByteUtils
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool TryParseHexUInt64Utf8Fixed16(ReadOnlySpan<byte> hex16Utf8, out ulong value)
     {
-        if (hex16Utf8.Length != 16)
-        {
-            value = 0;
-            return false;
-        }
-
-        ulong v = 0;
-        for (int i = 0; i < 16; i++)
-        {
-            int n = ParseHexNibbleUtf8(hex16Utf8[i]);
-            if (n < 0)
-            {
-                value = 0;
-                return false;
-            }
-            v = (v << 4) | (uint)n;
-        }
-
-        value = v;
-        return true;
+        return HexCodec.TryDecode16(hex16Utf8, out value);
     }
 
     /// <summary>
@@ -425,13 +326,7 @@ public static class ByteUtils
         if (destination.Length != 16)
             ThrowHelper.ThrowArgumentExceptionFixedSize(nameof(destination), 16);
 
-        ReadOnlySpan<char> alphabet = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
-
-        for (int i = 15; i >= 0; i--)
-        {
-            destination[i] = alphabet[(int)(value & 0xFu)];
-            value >>= 4;
-        }
+        HexCodec.Encode16(destination, value, uppercase);
     }
 
     /// <summary>
@@ -456,16 +351,11 @@ public static class ByteUtils
     /// <summary>
     /// Returns true if the provided UTF-8 span contains only hex characters (0-9, a-f, A-F).
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsAllHexUtf8(ReadOnlySpan<byte> utf8)
-    {
-        for (int i = 0; i < utf8.Length; i++)
-        {
-            if (ParseHexNibbleUtf8(utf8[i]) < 0)
-                return false;
-        }
-        return true;
-    }
+        => utf8.IndexOfAnyExcept(s_hexDigitsUtf8) < 0;
+
+    /// <summary>Vectorised membership test for hex digits; also used to validate large tokens before allocating for them.</summary>
+    private static readonly SearchValues<byte> s_hexDigitsUtf8 = SearchValues.Create("0123456789abcdefABCDEF"u8);
 
     /// <summary>
     /// Decodes a Base64 (standard or URL-safe) UTF-8 payload into a destination buffer without allocations.
@@ -524,8 +414,9 @@ public static class ByteUtils
     }
 
     /// <summary>
-    /// Decodes Base58 (Bitcoin/Solana alphabet) into exactly 32 bytes.
-    /// Intended for Solana public keys / hashes where decoded payload MUST be exactly 32 bytes.
+    /// Decodes Base58 (Bitcoin/Solana alphabet) into a 32-byte big-endian value.
+    /// Not canonical: leading '1' characters are skipped rather than matched against leading zero bytes, and any value
+    /// below 2^256 is accepted. Use <see cref="TryDecodeBase58ToUInt256BigEndian"/> to enforce the canonical form.
     /// </summary>
     /// <param name="utf8">Base58 text in UTF-8.</param>
     /// <param name="destination32">Destination span (must be exactly 32 bytes).</param>
@@ -535,33 +426,11 @@ public static class ByteUtils
         if (destination32.Length != 32)
             ThrowHelper.ThrowArgumentExceptionFixedSize(nameof(destination32), 32);
 
-        destination32.Clear();
-        if (utf8.IsEmpty) return false;
-
-        ReadOnlySpan<byte> map = Base58ReverseMap;
-
-        int leadingOnes = 0;
-        while (leadingOnes < utf8.Length && utf8[leadingOnes] == (byte)'1')
-            leadingOnes++;
-
-        for (int i = leadingOnes; i < utf8.Length; i++)
-        {
-            int digit = map[utf8[i]];
-            if (digit == 0xFF) return false;
-
-            int carry = digit;
-            for (int j = 31; j >= 0; j--)
-            {
-                int value = destination32[j] * 58 + carry;
-                destination32[j] = (byte)value;
-                carry = value >> 8;
-            }
-
-            if (carry != 0)
-                return false;
-        }
-
-        return true;
+        // Non-canonical by contract: leading '1' characters are skipped, not matched against leading zero bytes.
+        Span<ulong> limbs = stackalloc ulong[4];
+        bool ok = Base58Decoder.TryDecode32NonCanonical(utf8, limbs);
+        Base58Decoder.WriteBigEndian(limbs, destination32);
+        return ok;
     }
 
     /// <summary>
@@ -579,13 +448,18 @@ public static class ByteUtils
 
     /// <summary>
     /// Reads a <see cref="Vector256{T}"/> of bytes from a 32-byte span using an unaligned load.
-    /// The span must be at least 32 bytes long.
+    /// The span must be at least 32 bytes long; a shorter span throws <see cref="ArgumentException"/> instead of reading past it.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vector256<byte> ReadVector256(ReadOnlySpan<byte> bytes32)
-        => Unsafe.ReadUnaligned<Vector256<byte>>(ref MemoryMarshal.GetReference(bytes32));
+    {
+        if (bytes32.Length < 32)
+            ThrowHelper.ThrowArgumentExceptionDestinationTooSmall(nameof(bytes32));
 
-    private static ReadOnlySpan<byte> Base58ReverseMap => s_base58ReverseMap;
+        return Unsafe.ReadUnaligned<Vector256<byte>>(ref MemoryMarshal.GetReference(bytes32));
+    }
+
+    internal static ReadOnlySpan<byte> Base58ReverseMap => s_base58ReverseMap;
 
     private static readonly byte[] s_base58ReverseMap = CreateBase58ReverseMap();
 
@@ -641,27 +515,42 @@ public static class ByteUtils
         if (len == 0) return true;
         if (len > 64) return false;
 
+        if (len == 64)
+        {
+            // Full-width values (hashes, bytes32 words): the vectorised BCL decoder handles all 64 digits at once.
+            Bytes32 storage = default;
+            Span<byte> bytes = storage;
+            if (Convert.FromHexString(hexDigits, bytes, out _, out _) != OperationStatus.Done)
+                return false;
+
+            u3 = BinaryPrimitives.ReadUInt64BigEndian(bytes);
+            u2 = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(8));
+            u1 = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(16));
+            u0 = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(24));
+            return true;
+        }
+
         // Parse from right (least significant digits).
         ReadOnlySpan<byte> span = hexDigits;
 
-        if (!TakeLastHex(span, out span, out u0)) return false;
+        if (!TakeLastHex(span, out span, out u0)) { u0 = u1 = u2 = u3 = 0; return false; }
         if (span.Length == 0) return true;
 
-        if (!TakeLastHex(span, out span, out u1)) return false;
+        if (!TakeLastHex(span, out span, out u1)) { u0 = u1 = u2 = u3 = 0; return false; }
         if (span.Length == 0) return true;
 
-        if (!TakeLastHex(span, out span, out u2)) return false;
+        if (!TakeLastHex(span, out span, out u2)) { u0 = u1 = u2 = u3 = 0; return false; }
         if (span.Length == 0) return true;
 
-        if (!TakeLastHex(span, out span, out u3)) return false;
-        return span.Length == 0;
+        if (!TakeLastHex(span, out span, out u3) || span.Length != 0) { u0 = u1 = u2 = u3 = 0; return false; }
+        return true;
 
         static bool TakeLastHex(ReadOnlySpan<byte> input, out ReadOnlySpan<byte> remaining, out ulong value)
         {
             int take = input.Length >= 16 ? 16 : input.Length;
             remaining = input.Slice(0, input.Length - take);
             ReadOnlySpan<byte> tail = input.Slice(input.Length - take, take);
-            return TryParseHexUInt64Utf8Variable(tail, out value);
+            return take == 16 ? HexCodec.TryDecode16(tail, out value) : TryParseHexUInt64Utf8Variable(tail, out value);
         }
     }
 
@@ -676,32 +565,46 @@ public static class ByteUtils
         if (len == 0) return true;
         if (len > 64) return false;
 
+        if (len == 64)
+        {
+            Bytes32 storage = default;
+            Span<byte> bytes = storage;
+            if (Convert.FromHexString(hexDigits, bytes, out _, out _) != OperationStatus.Done)
+                return false;
+
+            u3 = BinaryPrimitives.ReadUInt64BigEndian(bytes);
+            u2 = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(8));
+            u1 = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(16));
+            u0 = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(24));
+            return true;
+        }
+
         ReadOnlySpan<char> span = hexDigits;
 
-        if (!TakeLastHex(span, out span, out u0)) return false;
+        if (!TakeLastHex(span, out span, out u0)) { u0 = u1 = u2 = u3 = 0; return false; }
         if (span.Length == 0) return true;
 
-        if (!TakeLastHex(span, out span, out u1)) return false;
+        if (!TakeLastHex(span, out span, out u1)) { u0 = u1 = u2 = u3 = 0; return false; }
         if (span.Length == 0) return true;
 
-        if (!TakeLastHex(span, out span, out u2)) return false;
+        if (!TakeLastHex(span, out span, out u2)) { u0 = u1 = u2 = u3 = 0; return false; }
         if (span.Length == 0) return true;
 
-        if (!TakeLastHex(span, out span, out u3)) return false;
-        return span.Length == 0;
+        if (!TakeLastHex(span, out span, out u3) || span.Length != 0) { u0 = u1 = u2 = u3 = 0; return false; }
+        return true;
 
         static bool TakeLastHex(ReadOnlySpan<char> input, out ReadOnlySpan<char> remaining, out ulong value)
         {
             int take = input.Length >= 16 ? 16 : input.Length;
             remaining = input.Slice(0, input.Length - take);
             ReadOnlySpan<char> tail = input.Slice(input.Length - take, take);
-            return TryParseHexUInt64CharsVariable(tail, out value);
+            return take == 16 ? HexCodec.TryDecode16(tail, out value) : TryParseHexUInt64CharsVariable(tail, out value);
         }
     }
 
     /// <summary>
     /// Parses UTF-8 decimal digits into four 64-bit limbs (little-endian limb order u0..u3).
-    /// Returns false if input is invalid or exceeds 256 bits.
+    /// Returns false if input is invalid or exceeds 256 bits. Leading zeros are accepted.
     /// </summary>
     public static bool TryParseUInt256DecimalUtf8(ReadOnlySpan<byte> digitsUtf8, out ulong u0, out ulong u1, out ulong u2, out ulong u3)
     {
@@ -710,31 +613,34 @@ public static class ByteUtils
         if (digitsUtf8.Length == 0)
             return false;
 
-        for (int i = 0; i < digitsUtf8.Length; i++)
+        int start = 0;
+        while (start < digitsUtf8.Length && digitsUtf8[start] == (byte)'0')
+            start++;
+
+        ReadOnlySpan<byte> digits = digitsUtf8.Slice(start);
+        if (digits.Length == 0)
+            return true;
+
+        // 2^256 - 1 has 78 digits: anything longer is invalid or too large.
+        if (digits.Length > MaxUInt256DecimalDigits)
+            return false;
+
+        // The first chunk takes the remainder so every later chunk is exactly 19 digits (one multiply by 10^19 each).
+        int first = digits.Length % DecimalChunkDigits;
+        if (first == 0)
+            first = DecimalChunkDigits;
+
+        if (!TryParseDecimalChunkUtf8(digits.Slice(0, first), out u0))
+            return false;
+
+        for (int position = first; position < digits.Length; position += DecimalChunkDigits)
         {
-            uint digit = (uint)(digitsUtf8[i] - (byte)'0');
-            if (digit > 9) return false;
-
-            UInt128 carry = digit;
-
-            UInt128 p0 = (UInt128)u0 * 10u + carry;
-            u0 = (ulong)p0;
-            carry = p0 >> 64;
-
-            UInt128 p1 = (UInt128)u1 * 10u + carry;
-            u1 = (ulong)p1;
-            carry = p1 >> 64;
-
-            UInt128 p2 = (UInt128)u2 * 10u + carry;
-            u2 = (ulong)p2;
-            carry = p2 >> 64;
-
-            UInt128 p3 = (UInt128)u3 * 10u + carry;
-            u3 = (ulong)p3;
-            carry = p3 >> 64;
-
-            if (carry != 0)
+            if (!TryParseDecimalChunkUtf8(digits.Slice(position, DecimalChunkDigits), out ulong chunk)
+                || !UInt256Math.TryMultiplyAdd(ref u0, ref u1, ref u2, ref u3, UInt256Math.TenPow19, chunk))
+            {
+                u0 = u1 = u2 = u3 = 0;
                 return false;
+            }
         }
 
         return true;
@@ -742,7 +648,7 @@ public static class ByteUtils
 
     /// <summary>
     /// Parses decimal digits into four 64-bit limbs (little-endian limb order u0..u3).
-    /// Returns false if input is invalid or exceeds 256 bits.
+    /// Returns false if input is invalid or exceeds 256 bits. Leading zeros are accepted.
     /// </summary>
     public static bool TryParseUInt256DecimalChars(ReadOnlySpan<char> digits, out ulong u0, out ulong u1, out ulong u2, out ulong u3)
     {
@@ -751,34 +657,130 @@ public static class ByteUtils
         if (digits.Length == 0)
             return false;
 
-        for (int i = 0; i < digits.Length; i++)
+        int start = 0;
+        while (start < digits.Length && digits[start] == '0')
+            start++;
+
+        digits = digits.Slice(start);
+        if (digits.Length == 0)
+            return true;
+
+        if (digits.Length > MaxUInt256DecimalDigits)
+            return false;
+
+        int first = digits.Length % DecimalChunkDigits;
+        if (first == 0)
+            first = DecimalChunkDigits;
+
+        if (!TryParseDecimalChunkChars(digits.Slice(0, first), out u0))
+            return false;
+
+        for (int position = first; position < digits.Length; position += DecimalChunkDigits)
         {
-            uint digit = (uint)(digits[i] - '0');
-            if (digit > 9) return false;
-
-            UInt128 carry = digit;
-
-            UInt128 p0 = (UInt128)u0 * 10u + carry;
-            u0 = (ulong)p0;
-            carry = p0 >> 64;
-
-            UInt128 p1 = (UInt128)u1 * 10u + carry;
-            u1 = (ulong)p1;
-            carry = p1 >> 64;
-
-            UInt128 p2 = (UInt128)u2 * 10u + carry;
-            u2 = (ulong)p2;
-            carry = p2 >> 64;
-
-            UInt128 p3 = (UInt128)u3 * 10u + carry;
-            u3 = (ulong)p3;
-            carry = p3 >> 64;
-
-            if (carry != 0)
+            if (!TryParseDecimalChunkChars(digits.Slice(position, DecimalChunkDigits), out ulong chunk)
+                || !UInt256Math.TryMultiplyAdd(ref u0, ref u1, ref u2, ref u3, UInt256Math.TenPow19, chunk))
+            {
+                u0 = u1 = u2 = u3 = 0;
                 return false;
+            }
         }
 
         return true;
+    }
+
+    private const int MaxUInt256DecimalDigits = 78;
+    private const int DecimalChunkDigits = 19;
+
+    /// <summary>Parses 1..19 ASCII digits (value below 10^19, so it always fits a <see cref="ulong"/>).</summary>
+    private static bool TryParseDecimalChunkUtf8(ReadOnlySpan<byte> chunk, out ulong value)
+    {
+        ulong result = 0;
+        int i = 0;
+
+        // Eight digits at a time (SWAR).
+        while (chunk.Length - i >= 8)
+        {
+            ulong word = BinaryPrimitives.ReadUInt64LittleEndian(chunk.Slice(i, 8));
+
+            // Every byte must be in '0'..'9': the high nibble is 3 and adding 6 keeps it 3.
+            if (((word & 0xF0F0F0F0F0F0F0F0UL) | (((word + 0x0606060606060606UL) & 0xF0F0F0F0F0F0F0F0UL) >> 4)) != 0x3333333333333333UL)
+            {
+                value = 0;
+                return false;
+            }
+
+            result = result * 100_000_000UL + CombineEightDigitValues(word - 0x3030303030303030UL);
+            i += 8;
+        }
+
+        for (; i < chunk.Length; i++)
+        {
+            uint digit = (uint)(chunk[i] - (byte)'0');
+            if (digit > 9)
+            {
+                value = 0;
+                return false;
+            }
+
+            result = result * 10 + digit;
+        }
+
+        value = result;
+        return true;
+    }
+
+    /// <summary>Parses 1..19 decimal characters (value below 10^19, so it always fits a <see cref="ulong"/>).</summary>
+    private static bool TryParseDecimalChunkChars(ReadOnlySpan<char> chunk, out ulong value)
+    {
+        ulong result = 0;
+        int i = 0;
+
+        while (chunk.Length - i >= 8)
+        {
+            Vector128<ushort> characters = Vector128.Create(MemoryMarshal.Cast<char, ushort>(chunk.Slice(i, 8)));
+            Vector128<ushort> digitValues = characters - Vector128.Create((ushort)'0');
+
+            // Unsigned compare: anything below '0' wraps to a large value and fails too.
+            if (!Vector128.LessThanOrEqualAll(digitValues, Vector128.Create((ushort)9)))
+            {
+                value = 0;
+                return false;
+            }
+
+            ulong word = Vector128.Narrow(digitValues, digitValues).AsUInt64().ToScalar();
+            result = result * 100_000_000UL + CombineEightDigitValues(BitConverter.IsLittleEndian ? word : BinaryPrimitives.ReverseEndianness(word));
+            i += 8;
+        }
+
+        for (; i < chunk.Length; i++)
+        {
+            uint digit = (uint)(chunk[i] - '0');
+            if (digit > 9)
+            {
+                value = 0;
+                return false;
+            }
+
+            result = result * 10 + digit;
+        }
+
+        value = result;
+        return true;
+    }
+
+    /// <summary>
+    /// Combines eight digit values (0..9, one per byte, first digit in the lowest byte) into a number below 10^8.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static uint CombineEightDigitValues(ulong digitValues)
+    {
+        const ulong Mask = 0x000000FF000000FFUL;
+        const ulong Multiplier1 = 0x000F424000000064UL; // 100 + (1_000_000 << 32)
+        const ulong Multiplier2 = 0x0000271000000001UL; // 1 + (10_000 << 32)
+
+        digitValues = digitValues * 10 + (digitValues >> 8); // adjacent pairs combined
+        digitValues = (((digitValues & Mask) * Multiplier1) + (((digitValues >> 16) & Mask) * Multiplier2)) >> 32;
+        return (uint)digitValues;
     }
 
 
@@ -920,16 +922,10 @@ public static class ByteUtils
     /// <summary>
     /// Returns true if every character is an ASCII hex digit (0-9, a-f, A-F).
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsAllHexChars(ReadOnlySpan<char> chars)
-    {
-        for (int i = 0; i < chars.Length; i++)
-        {
-            if (ParseHexNibble(chars[i]) < 0)
-                return false;
-        }
-        return true;
-    }
+        => chars.IndexOfAnyExcept(s_hexDigitsChars) < 0;
+
+    private static readonly SearchValues<char> s_hexDigitsChars = SearchValues.Create("0123456789abcdefABCDEF");
 
     /// <summary>
     /// Trims surrounding JSON string quotes (<c>"..."</c>) from a UTF-8 span if present.
@@ -953,12 +949,7 @@ public static class ByteUtils
         if (destination16.Length != 16)
             ThrowHelper.ThrowArgumentExceptionFixedSize(nameof(destination16), 16);
 
-        ReadOnlySpan<char> alphabet = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
-        for (int i = 15; i >= 0; i--)
-        {
-            destination16[i] = alphabet[(int)(value & 0xFu)];
-            value >>= 4;
-        }
+        HexCodec.Encode16(destination16, value, uppercase);
     }
 
     /// <summary>
@@ -996,6 +987,7 @@ public static class ByteUtils
     /// <remarks>
     /// Canonical enforcement requires the number of leading '1' characters to equal the number of leading zero bytes
     /// in the decoded 32-byte value. This rejects under-length and over-length encodings for Solana public keys.
+    /// The outputs are zero when the method returns false.
     /// </remarks>
     public static bool TryDecodeBase58ToUInt256BigEndian(
         ReadOnlySpan<byte> base58Utf8,
@@ -1021,42 +1013,62 @@ public static class ByteUtils
             return false;
 
         ReadOnlySpan<byte> map = Base58ReverseMap;
+        ReadOnlySpan<byte> digits = base58Utf8.Slice(leadingOnes);
 
-        for (int i = leadingOnes; i < base58Utf8.Length; i++)
+        // Fold up to 10 digits per step: value = value * 58^n + chunk. 58^10 < 2^64, so a fold is one 64x64 multiply
+        // per limb (instead of one per digit). The first chunk takes the remainder so every later chunk is full.
+        ulong r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+        int chunkLength = digits.Length % Base58DigitsPerChunk;
+        if (chunkLength == 0)
+            chunkLength = Base58DigitsPerChunk;
+
+        for (int index = 0; index < digits.Length; index += chunkLength, chunkLength = Base58DigitsPerChunk)
         {
-            byte c = base58Utf8[i];
-            int digit = map[c];
-            if (digit == 0xFF)
-                return false;
+            ulong chunk = 0;
+            ulong multiplier = 1;
+            for (int k = 0; k < chunkLength; k++)
+            {
+                int digit = map[digits[index + k]];
+                if (digit == 0xFF)
+                    return false;
 
-            if (!MulAdd58UInt256(ref u0Msb, ref u1, ref u2, ref u3Lsb, (uint)digit))
+                chunk = chunk * 58 + (uint)digit;
+                multiplier *= 58;
+            }
+
+            // A carry out of the top limb means the value reached 2^256; the value only grows, so stop here.
+            ulong carry = MulAdd(ref r3, multiplier, chunk);
+            carry = MulAdd(ref r2, multiplier, carry);
+            carry = MulAdd(ref r1, multiplier, carry);
+            carry = MulAdd(ref r0, multiplier, carry);
+            if (carry != 0)
                 return false;
         }
 
-        int leadingZeroBytes = CountLeadingZeroBytes256BigEndian(u0Msb, u1, u2, u3Lsb);
-        return leadingOnes == leadingZeroBytes;
+        if (leadingOnes != CountLeadingZeroBytes256BigEndian(r0, r1, r2, r3))
+            return false;
 
-        static bool MulAdd58UInt256(ref ulong u0Msb, ref ulong u1, ref ulong u2, ref ulong u3Lsb, uint addDigit)
+        u0Msb = r0;
+        u1 = r1;
+        u2 = r2;
+        u3Lsb = r3;
+        return true;
+
+        // limb = limb * multiplier + carryIn (mod 2^64); returns the carry out. high <= multiplier - 1, so adding the
+        // 0/1 carry from the low half cannot overflow.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static ulong MulAdd(ref ulong limb, ulong multiplier, ulong carryIn)
         {
-            UInt128 p3 = (UInt128)u3Lsb * 58u + addDigit;
-            u3Lsb = (ulong)p3;
-            ulong carry = (ulong)(p3 >> 64);
-
-            UInt128 p2 = (UInt128)u2 * 58u + carry;
-            u2 = (ulong)p2;
-            carry = (ulong)(p2 >> 64);
-
-            UInt128 p1 = (UInt128)u1 * 58u + carry;
-            u1 = (ulong)p1;
-            carry = (ulong)(p1 >> 64);
-
-            UInt128 p0 = (UInt128)u0Msb * 58u + carry;
-            u0Msb = (ulong)p0;
-            carry = (ulong)(p0 >> 64);
-
-            return carry == 0;
+            ulong high = Math.BigMul(limb, multiplier, out ulong low);
+            ulong sum = low + carryIn;
+            limb = sum;
+            return high + (sum < low ? 1UL : 0UL);
         }
     }
+
+    /// <summary>Digits folded per multiply when decoding Base58: 58^10 (about 4.3e17) is the largest power below 2^64.</summary>
+    private const int Base58DigitsPerChunk = 10;
+
 
     /// <summary>
     /// Encodes a 256-bit big-endian value to Base58 UTF-8 bytes.
@@ -1069,63 +1081,18 @@ public static class ByteUtils
         ulong u3Lsb,
         Span<byte> destination)
     {
-        // All-zero 32-byte value encodes as 32 '1' characters.
-        if ((u0Msb | u1 | u2 | u3Lsb) == 0)
-        {
-            if (destination.Length < 32)
-                return -1;
+        // Eight 32-bit limbs, most significant first. An all-zero value encodes as 32 '1' characters.
+        Span<uint> limbs = stackalloc uint[8];
+        limbs[0] = (uint)(u0Msb >> 32);
+        limbs[1] = (uint)u0Msb;
+        limbs[2] = (uint)(u1 >> 32);
+        limbs[3] = (uint)u1;
+        limbs[4] = (uint)(u2 >> 32);
+        limbs[5] = (uint)u2;
+        limbs[6] = (uint)(u3Lsb >> 32);
+        limbs[7] = (uint)u3Lsb;
 
-            destination.Slice(0, 32).Fill((byte)'1');
-            return 32;
-        }
-
-        int leadingZeroBytes = CountLeadingZeroBytes256BigEndian(u0Msb, u1, u2, u3Lsb);
-
-        // Convert by repeated div/mod 58 into a temporary buffer (reversed digits).
-        Span<byte> tmp = stackalloc byte[Address.MaxBase58Length];
-        int tmpLen = 0;
-
-        ulong v0 = u0Msb, v1 = u1, v2 = u2, v3 = u3Lsb;
-
-        while ((v0 | v1 | v2 | v3) != 0)
-        {
-            uint rem = DivMod58(ref v0, ref v1, ref v2, ref v3);
-            tmp[tmpLen++] = Base58Alphabet[(int)rem];
-        }
-
-        int totalLen = leadingZeroBytes + tmpLen;
-        if (destination.Length < totalLen)
-            return -1;
-
-        // Leading '1's.
-        destination.Slice(0, leadingZeroBytes).Fill((byte)'1');
-
-        // Reverse digits into output.
-        int outPos = leadingZeroBytes;
-        for (int i = tmpLen - 1; i >= 0; i--)
-            destination[outPos++] = tmp[i];
-
-        return totalLen;
-
-        static uint DivMod58(ref ulong u0, ref ulong u1, ref ulong u2, ref ulong u3)
-        {
-            ulong rem = 0;
-
-            u0 = DivMod64(u0, ref rem);
-            u1 = DivMod64(u1, ref rem);
-            u2 = DivMod64(u2, ref rem);
-            u3 = DivMod64(u3, ref rem);
-
-            return (uint)rem;
-
-            static ulong DivMod64(ulong value, ref ulong remainder)
-            {
-                UInt128 dividend = ((UInt128)remainder << 64) | value;
-                UInt128 q = dividend / 58u;
-                remainder = (ulong)(dividend - (q * 58u));
-                return (ulong)q;
-            }
-        }
+        return Base58Encoder.Encode(limbs, destination);
     }
 
     /// <summary>
@@ -1139,7 +1106,7 @@ public static class ByteUtils
     {
         if (hexDigitCount < 0) return -1;
         if (!allowOddLength && (hexDigitCount & 1) != 0) return -1;
-        return (hexDigitCount + 1) >> 1;
+        return (int)(((uint)hexDigitCount + 1) >> 1); // unsigned: int.MaxValue + 1 must not overflow
     }
 
     /// <summary>
@@ -1160,29 +1127,25 @@ public static class ByteUtils
         if (required < 0 || destination.Length < required)
             return false;
 
-        int src = 0;
         int dst = 0;
 
         if ((hexDigits.Length & 1) != 0)
         {
-            if (!allowOddLength)
-                return false;
-
-            int loNibble = ParseHexNibble(hexDigits[src++]);
+            int loNibble = ParseHexNibble(hexDigits[0]);
             if (loNibble < 0)
                 return false;
 
             destination[dst++] = (byte)loNibble; // 0x0? form
+            hexDigits = hexDigits.Slice(1);
         }
 
-        for (; src < hexDigits.Length; src += 2)
+        // Remaining digits are an even count: use the vectorised BCL decoder (rejects any non-hex character).
+        if (!hexDigits.IsEmpty)
         {
-            int hi = ParseHexNibble(hexDigits[src]);
-            int lo = ParseHexNibble(hexDigits[src + 1]);
-            if ((hi | lo) < 0)
+            if (Convert.FromHexString(hexDigits, destination.Slice(dst), out _, out int written) != OperationStatus.Done)
                 return false;
 
-            destination[dst++] = (byte)((hi << 4) | lo);
+            dst += written;
         }
 
         bytesWritten = dst;
@@ -1207,29 +1170,24 @@ public static class ByteUtils
         if (required < 0 || destination.Length < required)
             return false;
 
-        int src = 0;
         int dst = 0;
 
         if ((hexDigitsUtf8.Length & 1) != 0)
         {
-            if (!allowOddLength)
-                return false;
-
-            int loNibble = ParseHexNibbleUtf8(hexDigitsUtf8[src++]);
+            int loNibble = ParseHexNibbleUtf8(hexDigitsUtf8[0]);
             if (loNibble < 0)
                 return false;
 
             destination[dst++] = (byte)loNibble; // 0x0? form
+            hexDigitsUtf8 = hexDigitsUtf8.Slice(1);
         }
 
-        for (; src < hexDigitsUtf8.Length; src += 2)
+        if (!hexDigitsUtf8.IsEmpty)
         {
-            int hi = ParseHexNibbleUtf8(hexDigitsUtf8[src]);
-            int lo = ParseHexNibbleUtf8(hexDigitsUtf8[src + 1]);
-            if ((hi | lo) < 0)
+            if (Convert.FromHexString(hexDigitsUtf8, destination.Slice(dst), out _, out int written) != OperationStatus.Done)
                 return false;
 
-            destination[dst++] = (byte)((hi << 4) | lo);
+            dst += written;
         }
 
         bytesWritten = dst;
@@ -1244,19 +1202,12 @@ public static class ByteUtils
     /// <param name="uppercase">True for uppercase A-F; otherwise lowercase.</param>
     public static bool TryEncodeHexChars(ReadOnlySpan<byte> sourceBytes, Span<char> destination, bool uppercase)
     {
-        if (destination.Length < (sourceBytes.Length << 1))
+        if (destination.Length < (long)sourceBytes.Length * 2) // 64-bit: 2^30 bytes or more would wrap an int
             return false;
 
-        ReadOnlySpan<byte> alphabet = uppercase ? HexBytesUpper : HexBytesLower;
-
-        for (int i = 0; i < sourceBytes.Length; i++)
-        {
-            byte b = sourceBytes[i];
-            destination[(i << 1) + 0] = (char)alphabet[b >> 4];
-            destination[(i << 1) + 1] = (char)alphabet[b & 0x0F];
-        }
-
-        return true;
+        return uppercase
+            ? Convert.TryToHexString(sourceBytes, destination, out _)
+            : Convert.TryToHexStringLower(sourceBytes, destination, out _);
     }
 
     /// <summary>
@@ -1267,19 +1218,12 @@ public static class ByteUtils
     /// <param name="uppercase">True for uppercase A-F; otherwise lowercase.</param>
     public static bool TryEncodeHexUtf8(ReadOnlySpan<byte> sourceBytes, Span<byte> destination, bool uppercase)
     {
-        if (destination.Length < (sourceBytes.Length << 1))
+        if (destination.Length < (long)sourceBytes.Length * 2) // 64-bit: 2^30 bytes or more would wrap an int
             return false;
 
-        ReadOnlySpan<byte> alphabet = uppercase ? HexBytesUpper : HexBytesLower;
-
-        for (int i = 0; i < sourceBytes.Length; i++)
-        {
-            byte b = sourceBytes[i];
-            destination[(i << 1) + 0] = alphabet[b >> 4];
-            destination[(i << 1) + 1] = alphabet[b & 0x0F];
-        }
-
-        return true;
+        return uppercase
+            ? Convert.TryToHexString(sourceBytes, destination, out _)
+            : Convert.TryToHexStringLower(sourceBytes, destination, out _);
     }
 
     /// <summary>
@@ -1401,40 +1345,10 @@ public static class ByteUtils
         if (destination64.Length != 64)
             ThrowHelper.ThrowArgumentExceptionFixedSize(nameof(destination64), 64);
 
-        destination64.Clear();
-        if (base58Utf8.IsEmpty) return false;
-
-        ReadOnlySpan<byte> map = Base58ReverseMap;
-
-        int leadingOnes = 0;
-        while (leadingOnes < base58Utf8.Length && base58Utf8[leadingOnes] == (byte)'1')
-            leadingOnes++;
-
-        if (leadingOnes > 64)
-            return false;
-
-        for (int i = leadingOnes; i < base58Utf8.Length; i++)
-        {
-            int digit = map[base58Utf8[i]];
-            if (digit == 0xFF) return false;
-
-            int carry = digit;
-            for (int j = 63; j >= 0; j--)
-            {
-                int acc = destination64[j] * 58 + carry;
-                destination64[j] = (byte)acc;
-                carry = acc >> 8;
-            }
-
-            if (carry != 0)
-                return false;
-        }
-
-        int leadingZeroBytes = 0;
-        while (leadingZeroBytes < 64 && destination64[leadingZeroBytes] == 0)
-            leadingZeroBytes++;
-
-        return leadingOnes == leadingZeroBytes;
+        Span<ulong> limbs = stackalloc ulong[8];
+        bool ok = Base58Decoder.TryDecode64(base58Utf8, limbs);
+        Base58Decoder.WriteBigEndian(limbs, destination64);
+        return ok;
     }
 
     /// <summary>
@@ -1445,49 +1359,16 @@ public static class ByteUtils
         if (destination64.Length != 64)
             ThrowHelper.ThrowArgumentExceptionFixedSize(nameof(destination64), 64);
 
-        destination64.Clear();
-        if (base58Chars.IsEmpty) return false;
-
-        ReadOnlySpan<byte> map = Base58ReverseMap;
-
-        int leadingOnes = 0;
-        while (leadingOnes < base58Chars.Length && base58Chars[leadingOnes] == '1')
-            leadingOnes++;
-
-        if (leadingOnes > 64)
-            return false;
-
-        for (int i = leadingOnes; i < base58Chars.Length; i++)
-        {
-            char c = base58Chars[i];
-            if (c > 255) return false;
-
-            int digit = map[(byte)c];
-            if (digit == 0xFF) return false;
-
-            int carry = digit;
-            for (int j = 63; j >= 0; j--)
-            {
-                int acc = destination64[j] * 58 + carry;
-                destination64[j] = (byte)acc;
-                carry = acc >> 8;
-            }
-
-            if (carry != 0)
-                return false;
-        }
-
-        int leadingZeroBytes = 0;
-        while (leadingZeroBytes < 64 && destination64[leadingZeroBytes] == 0)
-            leadingZeroBytes++;
-
-        return leadingOnes == leadingZeroBytes;
+        Span<ulong> limbs = stackalloc ulong[8];
+        bool ok = Base58Decoder.TryDecode64(base58Chars, limbs);
+        Base58Decoder.WriteBigEndian(limbs, destination64);
+        return ok;
     }
 
     /// <summary>
     /// Attempts to normalise a JSON-RPC-like token containing a hex quantity into raw hex digits.
     /// Handles surrounding ASCII whitespace, optional JSON quotes, optional leading sign, and optional 0x prefix.
-    /// Treats an empty digit sequence as zero.
+    /// A prefix with no digits (<c>0x</c>) is zero; an empty token, including a quoted empty string (<c>""</c>), is rejected.
     /// </summary>
     /// <param name="utf8Token">The input token (may be <c>null</c>, quoted, or unquoted).</param>
     /// <param name="isNull">True if the token is the literal <c>null</c>.</param>
@@ -1554,7 +1435,7 @@ public static class ByteUtils
     /// intermediate buffers (stackalloc for small values; pooled buffers for larger values).
     /// </summary>
     /// <param name="hexDigitsUtf8">Hex digits in UTF-8 with no prefix and no sign.</param>
-    /// <param name="maxHexDigits">Maximum allowed hex digit count for DoS hygiene.</param>
+    /// <param name="maxHexDigits">Maximum allowed hex digit count for DoS hygiene; a negative value throws <see cref="ArgumentOutOfRangeException"/> (it used to disable the bound).</param>
     /// <param name="value">The parsed value on success.</param>
     /// <returns>True if parsing succeeded; otherwise false.</returns>
     public static bool TryParseBigIntegerHexUnsignedUtf8(
@@ -1562,12 +1443,14 @@ public static class ByteUtils
         int maxHexDigits,
         out BigInteger value)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(maxHexDigits);
+
         value = BigInteger.Zero;
 
         if (hexDigitsUtf8.IsEmpty)
             return true; // zero
 
-        if ((uint)hexDigitsUtf8.Length > (uint)maxHexDigits)
+        if (hexDigitsUtf8.Length > maxHexDigits)
             return false;
 
         int requiredBytes = (hexDigitsUtf8.Length + 1) >> 1;
@@ -1627,9 +1510,8 @@ public static class ByteUtils
         byte firstByte = trimmed[0];
         bool oddDigits = (firstByte >> 4) == 0;
 
-        int digitCount = (trimmed.Length << 1) - (oddDigits ? 1 : 0);
         int prefixCount = write0xPrefix ? 2 : 0;
-        int total = prefixCount + digitCount;
+        long total = prefixCount + ((long)trimmed.Length * 2) - (oddDigits ? 1 : 0); // 64-bit: 2^30 bytes or more would wrap an int
 
         if (destinationUtf8.Length < total)
             return false;
@@ -1677,6 +1559,9 @@ public static class ByteUtils
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int GetMaxHexUtf8LengthFromMagnitudeByteCount(int magnitudeByteCount, bool includeSign, bool include0xPrefix)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(magnitudeByteCount);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(magnitudeByteCount, (int.MaxValue - 3) / 2); // 2 digits per byte + sign + prefix must fit an int
+
         int sign = includeSign ? 1 : 0;
         int prefix = include0xPrefix ? 2 : 0;
 

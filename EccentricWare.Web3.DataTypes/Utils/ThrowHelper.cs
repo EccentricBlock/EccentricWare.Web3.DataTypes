@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 
@@ -15,6 +16,7 @@ internal static class ThrowHelper
     /// <summary>
     /// Throws an <see cref="ArgumentNullException"/>.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ThrowArgumentNullException(string paramName)
         => throw new ArgumentNullException(paramName);
@@ -22,6 +24,7 @@ internal static class ThrowHelper
     /// <summary>
     /// Throws an <see cref="ArgumentException"/> for an invalid function selector length.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ThrowArgumentExceptionInvalidFunctionSelectorLength(string paramName)
         => throw new ArgumentException("Function selector must be at least 4 bytes.", paramName);
@@ -29,6 +32,7 @@ internal static class ThrowHelper
     /// <summary>
     /// Throws an <see cref="ArgumentException"/> for an invalid discriminator length.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ThrowArgumentExceptionInvalidDiscriminatorLength(string paramName)
         => throw new ArgumentException("Instruction discriminator must be at least 8 bytes.", paramName);
@@ -36,6 +40,7 @@ internal static class ThrowHelper
     /// <summary>
     /// Throws an <see cref="ArgumentException"/> when a destination span is too small.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ThrowArgumentExceptionDestinationTooSmall(string paramName)
         => throw new ArgumentException("Destination buffer is too small.", paramName);
@@ -43,6 +48,7 @@ internal static class ThrowHelper
     /// <summary>
     /// Throws an <see cref="ArgumentException"/> when an argument is the wrong runtime type.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ThrowArgumentExceptionWrongType(string paramName, string expectedTypeName)
         => throw new ArgumentException($"Object must be of type {expectedTypeName}.", paramName);
@@ -50,6 +56,7 @@ internal static class ThrowHelper
     /// <summary>
     /// Throws an <see cref="ArgumentException"/> when a fixed-size span is the wrong length.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ThrowArgumentExceptionFixedSize(string paramName, int requiredLength)
         => throw new ArgumentException($"Destination must be exactly {requiredLength} elements long.", paramName);
@@ -57,6 +64,7 @@ internal static class ThrowHelper
     /// <summary>
     /// Throws a <see cref="FormatException"/> for an invalid function selector.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ThrowFormatExceptionInvalidFunctionSelector()
         => throw new FormatException("Invalid function selector hex value.");
@@ -64,6 +72,7 @@ internal static class ThrowHelper
     /// <summary>
     /// Throws a <see cref="FormatException"/> for an invalid instruction discriminator.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ThrowFormatExceptionInvalidDiscriminator()
         => throw new FormatException("Invalid instruction discriminator hex value.");
@@ -71,23 +80,59 @@ internal static class ThrowHelper
     /// <summary>
     /// Throws a <see cref="FormatException"/> for an unsupported format string.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ThrowFormatExceptionUnknownFormat(ReadOnlySpan<char> format)
         => throw new FormatException($"Unknown format: \"{format.ToString()}\"");
 
     /// <summary>
-    /// Throws a <see cref="JsonException"/> indicating a string token was expected.
+    /// Throws a <see cref="JsonException"/> because a string token exceeds the size the converters will buffer.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void ThrowJsonExceptionExpectedString(string typeName)
-        => throw new JsonException($"Expected JSON string for {typeName}.");
+    public static void ThrowJsonExceptionTokenTooLarge(string typeName, int maxLength)
+        => throw new JsonException($"The JSON string token for {typeName} exceeds the {maxLength.ToString("N0", CultureInfo.InvariantCulture)}-byte limit.");
+
+    /// <summary>
+    /// Throws a <see cref="JsonException"/> because a dictionary key is larger than the type allows as a key.
+    /// </summary>
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static void ThrowJsonExceptionKeyTooLarge(string typeName, int maxBytes)
+        => throw new JsonException($"A {typeName} dictionary key exceeds the {maxBytes.ToString("N0", CultureInfo.InvariantCulture)}-byte limit.");
+
+    /// <summary>
+    /// Throws a <see cref="JsonException"/> for a token a converter cannot read: a JSON <c>null</c> (never silently mapped
+    /// to a zero value; use a nullable type where absence matters) or any other non-string, non-number token.
+    /// </summary>
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static void ThrowJsonExceptionUnexpectedToken(string typeName, JsonTokenType tokenType, bool numberAllowed)
+    {
+        if (tokenType == JsonTokenType.Null)
+            throw new JsonException($"Cannot read null into {typeName}.");
+
+        throw new JsonException(numberAllowed
+            ? $"Expected JSON string or number for {typeName}."
+            : $"Expected JSON string for {typeName}.");
+    }
 
     /// <summary>
     /// Throws a <see cref="JsonException"/> indicating an invalid value for the target type.
     /// </summary>
+    [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ThrowJsonExceptionInvalidValue(string typeName)
         => throw new JsonException($"Invalid value for {typeName}.");
+
+    /// <summary>
+    /// Throws a <see cref="JsonException"/> because a value could not be formatted into the converter's buffer.
+    /// </summary>
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static void ThrowJsonExceptionFormatFailed(string typeName)
+        => throw new JsonException($"Failed to format {typeName}.");
+
     [DoesNotReturn]
     public static void ThrowFormatExceptionInvalidBase64()
      => throw new FormatException("Invalid Base64 encoded value.");
@@ -121,24 +166,8 @@ internal static class ThrowHelper
         => throw new ArgumentException($"Solana address requires exactly {Address.SolanaByteLength} bytes", paramName);
 
     [DoesNotReturn]
-    public static void ThrowFormatExceptionEmpty()
-        => throw new FormatException("Address string cannot be empty");
-
-    [DoesNotReturn]
-    public static void ThrowFormatExceptionInvalidEvmHexLength()
-        => throw new FormatException($"EVM address requires exactly {Address.EvmHexLength} hex characters (20 bytes)");
-
-    [DoesNotReturn]
-    public static void ThrowFormatExceptionInvalidBase58Length()
-        => throw new FormatException($"Solana address must be 1-{Address.MaxBase58Length} Base58 characters");
-
-    [DoesNotReturn]
     public static void ThrowFormatExceptionInvalidBase58()
         => throw new FormatException("Invalid Base58 string for Solana address");
-
-    [DoesNotReturn]
-    public static void ThrowFormatExceptionInvalidFunctionSelectorHexLength()
-        => throw new FormatException($"FunctionSelector requires exactly {FunctionSelector.HexLength} hex characters (4 bytes)");
 
     // Signature exceptions
     [DoesNotReturn]
@@ -158,11 +187,11 @@ internal static class ThrowHelper
         => throw new ArgumentException($"Solana signature requires exactly {Signature.SolanaByteLength} bytes", paramName);
 
     [DoesNotReturn]
-    public static void ThrowFormatExceptionInvalidSignatureHexLength()
-        => throw new FormatException($"Signature requires {Signature.EvmHexLength} (EVM) or {Signature.SolanaHexLength} (Solana) hex characters");
+    public static void ThrowFormatExceptionInvalidSignature()
+        => throw new FormatException($"Invalid signature: expected hex with an optional 0x prefix ({Signature.EvmHexLength} digits for EVM, {Signature.SolanaHexLength} for Solana) or Solana Base58 without a prefix");
 
-    // HexBytes exceptions
     [DoesNotReturn]
-    public static void ThrowFormatExceptionOddHexLength()
-        => throw new FormatException("Hex string must have an even number of characters");
+    public static void ThrowInvalidOperationExceptionBase58RequiresSolanaSignature()
+        => throw new InvalidOperationException("Base58 is only defined for Solana signatures; this is an EVM signature.");
+
 }

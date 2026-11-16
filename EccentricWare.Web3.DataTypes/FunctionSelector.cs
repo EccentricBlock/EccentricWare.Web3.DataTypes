@@ -1,12 +1,11 @@
 using EccentricWare.Web3.DataTypes.JsonConverters;
 using EccentricWare.Web3.DataTypes.Utils;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
 using System.Text;
 using System.Text.Json.Serialization;
 
@@ -161,21 +160,31 @@ public readonly struct FunctionSelector :
 
     /// <summary>
     /// Computes a selector from an EVM function signature (UTF-16 chars, cold path).
-    /// Encodes to UTF-8 without allocating for short signatures.
+    /// Encodes to UTF-8 without allocating. An empty span hashes the empty string (0xc5d24601), exactly like the UTF-8 overload.
     /// </summary>
     /// <param name="signatureChars">Function signature characters.</param>
     public static FunctionSelector FromSignature(ReadOnlySpan<char> signatureChars)
     {
-        if (signatureChars.IsEmpty)
-            return Zero;
-
+        // Exact byte count (not the 3x worst case) so real-world signatures of up to 256 UTF-8 bytes stay on the stack;
+        // longer ones use the shared pool rather than a fresh array.
         const int StackLimit = 256;
-        int maxBytes = Encoding.UTF8.GetMaxByteCount(signatureChars.Length);
+        int byteCount = Encoding.UTF8.GetByteCount(signatureChars);
 
-        Span<byte> utf8 = maxBytes <= StackLimit ? stackalloc byte[maxBytes] : new byte[maxBytes];
-        int written = Encoding.UTF8.GetBytes(signatureChars, utf8);
+        byte[]? rented = null;
+        Span<byte> utf8 = byteCount <= StackLimit
+            ? stackalloc byte[StackLimit]
+            : (rented = ArrayPool<byte>.Shared.Rent(byteCount));
 
-        return FromSignature(utf8.Slice(0, written));
+        try
+        {
+            int written = Encoding.UTF8.GetBytes(signatureChars, utf8);
+            return FromSignature(utf8.Slice(0, written));
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     /// <summary>
@@ -202,22 +211,22 @@ public readonly struct FunctionSelector :
 
     /// <summary>
     /// Formats the selector using supported formats: "", "x", "X", "0x", "0X".
-    /// Empty format defaults to "0x" with lowercase digits.
+    /// Empty format defaults to "0x" with lowercase digits. The prefix is always lowercase "0x"; "X" and "0X" select uppercase digits.
     /// </summary>
     /// <param name="format">Format specifier.</param>
     /// <param name="formatProvider">Unused (present for interface compatibility).</param>
     public string ToString(string? format, IFormatProvider? formatProvider = null)
     {
-        DecodeFormat(format.AsSpanSafe(), out bool hasPrefix, out bool uppercaseDigits, out char prefixChar);
+        HexFormat.Parse(format, out bool hasPrefix, out bool uppercaseDigits);
 
         int len = hasPrefix ? HexLength + 2 : HexLength;
 
-        return string.Create(len, (Value: _value, HasPrefix: hasPrefix, Upper: uppercaseDigits, PrefixChar: prefixChar), static (dst, state) =>
+        return string.Create(len, (Value: _value, HasPrefix: hasPrefix, Upper: uppercaseDigits), static (dst, state) =>
         {
             if (state.HasPrefix)
             {
                 dst[0] = '0';
-                dst[1] = state.PrefixChar;
+                dst[1] = 'x';
                 ByteUtils.WriteHexUInt32CharsFixed8(dst.Slice(2), state.Value, state.Upper);
             }
             else
@@ -229,11 +238,11 @@ public readonly struct FunctionSelector :
 
     /// <summary>
     /// Attempts to format the selector into a character buffer without allocations.
-    /// Supported formats: "", "x", "X", "0x", "0X".
+    /// Supported formats: "", "x", "X", "0x", "0X" (the prefix is always lowercase "0x").
     /// </summary>
     public bool TryFormat(Span<char> destination, out int charsWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        DecodeFormat(format, out bool hasPrefix, out bool uppercaseDigits, out char prefixChar);
+        HexFormat.Parse(format, out bool hasPrefix, out bool uppercaseDigits);
 
         int required = hasPrefix ? HexLength + 2 : HexLength;
         if (destination.Length < required)
@@ -245,12 +254,12 @@ public readonly struct FunctionSelector :
         if (hasPrefix)
         {
             destination[0] = '0';
-            destination[1] = prefixChar;
-            ByteUtils.WriteHexUInt32CharsFixed8(destination.Slice(2), _value, uppercaseDigits);
+            destination[1] = 'x';
+            ByteUtils.WriteHexUInt32CharsFixed8(destination.Slice(2, HexLength), _value, uppercaseDigits);
         }
         else
         {
-            ByteUtils.WriteHexUInt32CharsFixed8(destination, _value, uppercaseDigits);
+            ByteUtils.WriteHexUInt32CharsFixed8(destination.Slice(0, HexLength), _value, uppercaseDigits);
         }
 
         charsWritten = required;
@@ -259,11 +268,11 @@ public readonly struct FunctionSelector :
 
     /// <summary>
     /// Attempts to format the selector into a UTF-8 buffer without allocations.
-    /// Supported formats: "", "x", "X", "0x", "0X".
+    /// Supported formats: "", "x", "X", "0x", "0X" (the prefix is always lowercase "0x").
     /// </summary>
     public bool TryFormat(Span<byte> utf8Destination, out int bytesWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        DecodeFormat(format, out bool hasPrefix, out bool uppercaseDigits, out char prefixChar);
+        HexFormat.Parse(format, out bool hasPrefix, out bool uppercaseDigits);
 
         int required = hasPrefix ? HexLength + 2 : HexLength;
         if (utf8Destination.Length < required)
@@ -275,12 +284,12 @@ public readonly struct FunctionSelector :
         if (hasPrefix)
         {
             utf8Destination[0] = (byte)'0';
-            utf8Destination[1] = (byte)prefixChar;
-            ByteUtils.WriteHexUInt32Utf8Fixed8(utf8Destination.Slice(2), _value, uppercaseDigits);
+            utf8Destination[1] = (byte)'x';
+            ByteUtils.WriteHexUInt32Utf8Fixed8(utf8Destination.Slice(2, HexLength), _value, uppercaseDigits);
         }
         else
         {
-            ByteUtils.WriteHexUInt32Utf8Fixed8(utf8Destination, _value, uppercaseDigits);
+            ByteUtils.WriteHexUInt32Utf8Fixed8(utf8Destination.Slice(0, HexLength), _value, uppercaseDigits);
         }
 
         bytesWritten = required;
@@ -316,7 +325,11 @@ public readonly struct FunctionSelector :
     /// <summary>
     /// Parses a selector using <see cref="ISpanParsable{TSelf}"/> semantics.
     /// </summary>
-    public static FunctionSelector Parse(string s) => Parse(s.AsSpan(), CultureInfo.InvariantCulture);
+    public static FunctionSelector Parse(string s)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        return Parse(s.AsSpan(), CultureInfo.InvariantCulture);
+    }
 
     /// <summary>
     /// Parses a selector using <see cref="ISpanParsable{TSelf}"/> semantics.
@@ -333,7 +346,11 @@ public readonly struct FunctionSelector :
     /// <summary>
     /// Parses a selector using <see cref="ISpanParsable{TSelf}"/> semantics.
     /// </summary>
-    public static FunctionSelector Parse(string s, IFormatProvider? provider) => Parse(s.AsSpan(), provider);
+    public static FunctionSelector Parse(string s, IFormatProvider? provider)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        return Parse(s.AsSpan(), provider);
+    }
 
     /// <summary>
     /// Attempts to parse a selector literal from UTF-8 without throwing.
@@ -492,59 +509,12 @@ public readonly struct FunctionSelector :
 
     /// <summary>
     /// Returns true if <paramref name="needle"/> is contained in <paramref name="haystack"/>.
-    /// Uses SIMD for large spans when supported; falls back to scalar scanning.
+    /// Delegates to the BCL's vectorised search (AVX2/AVX-512 on x64, NEON on Arm64, scalar elsewhere).
     /// </summary>
     /// <param name="haystack">Selector span to scan.</param>
     /// <param name="needle">Selector to find.</param>
     public static bool ContainsSimd(ReadOnlySpan<FunctionSelector> haystack, FunctionSelector needle)
-    {
-        ReadOnlySpan<uint> values = MemoryMarshal.Cast<FunctionSelector, uint>(haystack);
-        uint target = needle._value;
-
-        int i = 0;
-
-        // Threshold should be tuned under production workloads.
-        if (values.Length >= 64 && Avx2.IsSupported)
-        {
-            Vector256<uint> vt = Vector256.Create(target);
-            int last = values.Length & ~7;
-
-            ref uint r0 = ref MemoryMarshal.GetReference(values);
-            for (; i < last; i += 8)
-            {
-                Vector256<uint> v = Unsafe.ReadUnaligned<Vector256<uint>>(
-                    ref Unsafe.As<uint, byte>(ref Unsafe.Add(ref r0, i)));
-
-                Vector256<uint> eq = Avx2.CompareEqual(v, vt);
-                if (Avx2.MoveMask(eq.AsByte()) != 0)
-                    return true;
-            }
-        }
-        else if (values.Length >= 32 && Sse2.IsSupported)
-        {
-            Vector128<uint> vt = Vector128.Create(target);
-            int last = values.Length & ~3;
-
-            ref uint r0 = ref MemoryMarshal.GetReference(values);
-            for (; i < last; i += 4)
-            {
-                Vector128<uint> v = Unsafe.ReadUnaligned<Vector128<uint>>(
-                    ref Unsafe.As<uint, byte>(ref Unsafe.Add(ref r0, i)));
-
-                Vector128<uint> eq = Sse2.CompareEqual(v, vt);
-                if (Sse2.MoveMask(eq.AsByte()) != 0)
-                    return true;
-            }
-        }
-
-        for (; i < values.Length; i++)
-        {
-            if (values[i] == target)
-                return true;
-        }
-
-        return false;
-    }
+        => MemoryMarshal.Cast<FunctionSelector, uint>(haystack).Contains(needle._value);
 
     /// <summary>
     /// Returns a selector constructed from an unsigned integer.
@@ -575,11 +545,20 @@ public readonly struct FunctionSelector :
     /// </summary>
     public override bool Equals(object? obj) => obj is FunctionSelector other && Equals(other);
 
+    /// <summary>Per-process random multiplier; see <see cref="HashSeed"/>.</summary>
+    private static readonly ulong s_hashMultiplier = HashSeed.NextOddMultiplier();
+
     /// <summary>
-    /// Returns a hash code suitable for hash tables.
+    /// Returns a hash code suitable for hash tables. It is randomised per process (multiply and fold), so it is neither
+    /// stable across runs nor equal to <see cref="Value"/>; selectors are attacker-chosen 32-bit values, and an identity
+    /// hash lets crafted keys collide in dictionary buckets.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public override int GetHashCode() => unchecked((int)_value);
+    public override int GetHashCode()
+    {
+        ulong h = (ulong)_value * s_hashMultiplier;
+        return unchecked((int)((h >> 32) ^ h));
+    }
 
     /// <summary>
     /// Compares this selector to another selector.
@@ -621,70 +600,6 @@ public readonly struct FunctionSelector :
     /// <summary>Greater-than-or-equal operator.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool operator >=(FunctionSelector left, FunctionSelector right) => left._value >= right._value;
-
-    /// <summary>
-    /// Decodes supported format strings without allocations or expensive comparisons.
-    /// Supported formats: "", "x", "X", "0x", "0X".
-    /// </summary>
-    /// <param name="format">Format span.</param>
-    /// <param name="hasPrefix">True if output should contain 0x/0X prefix.</param>
-    /// <param name="uppercaseDigits">True for uppercase A-F digits.</param>
-    /// <param name="prefixChar">'x' or 'X' when <paramref name="hasPrefix"/> is true.</param>
-    private static void DecodeFormat(ReadOnlySpan<char> format, out bool hasPrefix, out bool uppercaseDigits, out char prefixChar)
-    {
-        // Default format: 0x + lowercase digits.
-        if (format.Length == 0)
-        {
-            hasPrefix = true;
-            uppercaseDigits = false;
-            prefixChar = 'x';
-            return;
-        }
-
-        if (format.Length == 1)
-        {
-            char c = format[0];
-            if (c == 'x')
-            {
-                hasPrefix = false;
-                uppercaseDigits = false;
-                prefixChar = 'x';
-                return;
-            }
-
-            if (c == 'X')
-            {
-                hasPrefix = false;
-                uppercaseDigits = true;
-                prefixChar = 'X';
-                return;
-            }
-        }
-        else if (format.Length == 2 && format[0] == '0')
-        {
-            char c = format[1];
-            if (c == 'x')
-            {
-                hasPrefix = true;
-                uppercaseDigits = false;
-                prefixChar = 'x';
-                return;
-            }
-
-            if (c == 'X')
-            {
-                hasPrefix = true;
-                uppercaseDigits = true;
-                prefixChar = 'X';
-                return;
-            }
-        }
-
-        ThrowHelper.ThrowFormatExceptionUnknownFormat(format);
-        hasPrefix = true;
-        uppercaseDigits = false;
-        prefixChar = 'x';
-    }
 
     /// <summary>
     /// Common ERC-20 selectors (compile-time constants).

@@ -7,7 +7,7 @@
     <PackageProjectUrl></PackageProjectUrl>
     <Title>Web3</Title>
     <PackageId>EccentricWare.Web3.DataTypes</PackageId>
-    <Version>1.1</Version>
+    <Version>2.0</Version>
     <Authors>EccentricBlock</Authors>
     <Company>EccentricWare</Company>
     <Description>Zero/Minimal allocation Web3 DataTypes for use within Web3/blockchain projects.</Description>
@@ -15,7 +15,7 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>Web3,Solana,EVM,Ethereum,Blockchain</PackageTags>
     <NeutralLanguage>en</NeutralLanguage>
-    <AssemblyVersion>1.1</AssemblyVersion>
+    <AssemblyVersion>2.0</AssemblyVersion>
     <IncludeSymbols>True</IncludeSymbols>
     <AnalysisLevel>latest-recommended</AnalysisLevel>
     <PackageReadmeFile>README.md</PackageReadmeFile>
@@ -42,7 +42,12 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.1" />
+    <!-- Lets the test project exercise internal arithmetic (Knuth division, chunked formatting) directly. -->
+    <InternalsVisibleTo Include="Eccentricware.Web3.DataTypes.Test" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.15" />
   </ItemGroup>
 
 </Project>

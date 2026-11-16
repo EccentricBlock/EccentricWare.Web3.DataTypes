@@ -3,11 +3,18 @@
 namespace EccentricWare.Web3.DataTypes.Comparers;
 
 /// <summary>
-/// High-performance comparer for <see cref="uint256"/> suitable for:
+/// Comparer for <see cref="uint256"/> suitable for:
 /// - Dictionary/HashSet keys (IEqualityComparer)
 /// - Sorted collections (IComparer)
 /// Uses the struct's optimised equality and hashing implementations.
 /// </summary>
+/// <remarks>
+/// Use this where an <see cref="IEqualityComparer{T}"/> / <see cref="IComparer{T}"/> instance is required by an API.
+/// For <c>Dictionary</c>, <c>HashSet</c> and <c>Array.Sort</c> prefer the default comparer (omit the argument):
+/// the struct implements <see cref="IEquatable{T}"/> and <see cref="IComparable{T}"/>, so the runtime devirtualises and
+/// inlines it. Benchmarks show lookups are equal either way, but sorting with an explicit comparer instance is
+/// measurably slower because it goes through interface dispatch.
+/// </remarks>
 public sealed class UInt256Comparer : IEqualityComparer<uint256>, IComparer<uint256>
 {
     /// <summary>

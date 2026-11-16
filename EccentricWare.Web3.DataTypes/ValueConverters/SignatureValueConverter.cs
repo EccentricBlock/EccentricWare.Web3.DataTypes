@@ -13,16 +13,40 @@ namespace EccentricWare.Web3.DataTypes.ValueConverters;
 /// - [1..64]  : Signature payload (64 bytes)
 /// - [65]     : EVM v byte (0 for Solana)
 ///
+/// The layout is ordered like <see cref="Signature.CompareTo(Signature)"/> (type, payload, v), so ORDER BY on the
+/// binary column and in-memory sorting agree.
+///
 /// Recommended column types:
 /// - SQL Server: BINARY(66) or VARBINARY(66)
 /// - PostgreSQL: BYTEA (enforce length via constraint if needed)
+///
+/// The converter declares a 66-byte size hint; hints supplied by the caller are laid over it. A stored value that is not a
+/// well-formed row (wrong length, unknown type byte, or a non-zero v byte on a Solana row) throws
+/// <see cref="FormatException"/>; a null value throws <see cref="ArgumentNullException"/>.
 /// </remarks>
-/// <remarks>
-/// Creates the converter with an optional mapping hint for fixed-size storage.
-/// </remarks>
-public sealed class SignatureValueConverter(ConverterMappingHints? mappingHints = null) : ValueConverter<Signature, byte[]>(ToProviderExpression, FromProviderExpression,
-        mappingHints ?? new ConverterMappingHints(size: 66))
+public sealed class SignatureValueConverter : ValueConverter<Signature, byte[]>
 {
+    /// <summary>The fixed provider length in bytes.</summary>
+    public const int StorageSize = 66;
+
+    private static readonly ConverterMappingHints DefaultHints = new(size: StorageSize);
+
+    /// <summary>
+    /// Creates the converter with the default 66-byte mapping hint. EF Core instantiates converter types through a
+    /// public parameterless constructor (optional parameters do not count), so one is declared explicitly.
+    /// </summary>
+    public SignatureValueConverter() : this(null)
+    {
+    }
+
+    /// <summary>
+    /// Creates the converter; hints supplied by the caller take precedence over the default 66-byte size.
+    /// </summary>
+    public SignatureValueConverter(ConverterMappingHints? mappingHints)
+        : base(ToProviderExpression, FromProviderExpression, ConverterHints.Merge(DefaultHints, mappingHints))
+    {
+    }
+
     private static readonly Expression<Func<Signature, byte[]>> ToProviderExpression
         = sig => ToProviderBytes(sig);
 
@@ -34,7 +58,7 @@ public sealed class SignatureValueConverter(ConverterMappingHints? mappingHints 
     /// </summary>
     private static byte[] ToProviderBytes(Signature signature)
     {
-        byte[] bytes = new byte[66];
+        byte[] bytes = new byte[StorageSize];
         bytes[0] = (byte)signature.Type;
 
         // Writes 64 payload bytes; for EVM writes v into offset 64 of this span (i.e. bytes[65]).
@@ -49,16 +73,24 @@ public sealed class SignatureValueConverter(ConverterMappingHints? mappingHints 
     {
         ArgumentNullException.ThrowIfNull(bytes);
 
-        if (bytes.Length != 66)
-            throw new ArgumentException("Invalid signature byte length; expected 66 bytes.", nameof(bytes));
+        if (bytes.Length != StorageSize)
+            throw new FormatException($"Invalid signature byte length; expected {StorageSize} bytes.");
 
-        SignatureType type = (SignatureType)bytes[0];
-
-        return type switch
+        switch ((SignatureType)bytes[0])
         {
-            SignatureType.Evm => Signature.FromEvmBytes(bytes.AsSpan(1, Signature.EvmByteLength)),
-            SignatureType.Solana => Signature.FromSolanaBytes(bytes.AsSpan(1, Signature.SolanaByteLength)),
-            _ => throw new ArgumentOutOfRangeException(nameof(bytes), "Unknown signature type byte.")
-        };
+            case SignatureType.Evm:
+                return Signature.FromEvmBytes(bytes.AsSpan(1, Signature.EvmByteLength));
+
+            case SignatureType.Solana:
+                // A Solana signature has no v. A non-zero byte 65 means the row was not written by this converter;
+                // dropping it silently would hide corruption.
+                if (bytes[65] != 0)
+                    throw new FormatException("Invalid Solana signature row; byte 65 (v) must be zero.");
+
+                return Signature.FromSolanaBytes(bytes.AsSpan(1, Signature.SolanaByteLength));
+
+            default:
+                throw new FormatException("Unknown signature type byte.");
+        }
     }
 }

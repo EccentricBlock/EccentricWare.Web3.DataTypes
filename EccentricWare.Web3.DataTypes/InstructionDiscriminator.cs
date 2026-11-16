@@ -1,4 +1,4 @@
-﻿using EccentricWare.Web3.DataTypes.JsonConverters;
+using EccentricWare.Web3.DataTypes.JsonConverters;
 using EccentricWare.Web3.DataTypes.Utils;
 using System.Buffers.Binary;
 using System.Diagnostics.CodeAnalysis;
@@ -64,6 +64,32 @@ public readonly struct InstructionDiscriminator :
     }
 
     /// <summary>
+    /// Gets whether the discriminator is 0x0000000000000000.
+    /// </summary>
+    public bool IsZero
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _value == 0;
+    }
+
+    /// <summary>
+    /// Gets the discriminator as a signed 64-bit integer (useful for database providers without unsigned 64-bit columns).
+    /// Note that signed ordering differs from unsigned ordering for values with the top bit set.
+    /// </summary>
+    public long AsInt64
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => unchecked((long)_value);
+    }
+
+    /// <summary>
+    /// Creates a discriminator from a signed 64-bit value (the inverse of <see cref="AsInt64"/>).
+    /// </summary>
+    /// <param name="value">Signed database value.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static InstructionDiscriminator FromInt64(long value) => new(unchecked((ulong)value));
+
+    /// <summary>
     /// Writes the discriminator to a destination buffer as 8 bytes in big-endian order.
     /// </summary>
     /// <param name="destination">Destination span (must be at least 8 bytes).</param>
@@ -119,20 +145,20 @@ public readonly struct InstructionDiscriminator :
 
     /// <summary>
     /// Formats the discriminator using supported formats: "", "x", "X", "0x", "0X".
-    /// Empty format defaults to "0x" with lowercase digits.
+    /// Empty format defaults to "0x" with lowercase digits. The prefix is always lowercase "0x"; "X" and "0X" select uppercase digits.
     /// </summary>
     public string ToString(string? format, IFormatProvider? formatProvider = null)
     {
-        FunctionSelectorFormat.Decode(format.AsSpanSafe(), out bool hasPrefix, out bool upperDigits, out char prefixChar);
+        HexFormat.Parse(format, out bool hasPrefix, out bool upperDigits);
 
         int len = hasPrefix ? HexLength + 2 : HexLength;
 
-        return string.Create(len, (Value: _value, HasPrefix: hasPrefix, Upper: upperDigits, PrefixChar: prefixChar), static (dst, state) =>
+        return string.Create(len, (Value: _value, HasPrefix: hasPrefix, Upper: upperDigits), static (dst, state) =>
         {
             if (state.HasPrefix)
             {
                 dst[0] = '0';
-                dst[1] = state.PrefixChar;
+                dst[1] = 'x';
                 ByteUtils.WriteHexUInt64(dst.Slice(2), state.Value, state.Upper);
             }
             else
@@ -147,7 +173,7 @@ public readonly struct InstructionDiscriminator :
     /// </summary>
     public bool TryFormat(Span<char> destination, out int charsWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        FunctionSelectorFormat.Decode(format, out bool hasPrefix, out bool upperDigits, out char prefixChar);
+        HexFormat.Parse(format, out bool hasPrefix, out bool upperDigits);
 
         int required = hasPrefix ? HexLength + 2 : HexLength;
         if (destination.Length < required)
@@ -159,12 +185,12 @@ public readonly struct InstructionDiscriminator :
         if (hasPrefix)
         {
             destination[0] = '0';
-            destination[1] = prefixChar;
-            ByteUtils.WriteHexUInt64(destination.Slice(2), _value, upperDigits);
+            destination[1] = 'x';
+            ByteUtils.WriteHexUInt64(destination.Slice(2, HexLength), _value, upperDigits);
         }
         else
         {
-            ByteUtils.WriteHexUInt64(destination, _value, upperDigits);
+            ByteUtils.WriteHexUInt64(destination.Slice(0, HexLength), _value, upperDigits);
         }
 
         charsWritten = required;
@@ -176,7 +202,7 @@ public readonly struct InstructionDiscriminator :
     /// </summary>
     public bool TryFormat(Span<byte> utf8Destination, out int bytesWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        FunctionSelectorFormat.Decode(format, out bool hasPrefix, out bool upperDigits, out char prefixChar);
+        HexFormat.Parse(format, out bool hasPrefix, out bool upperDigits);
 
         int required = hasPrefix ? HexLength + 2 : HexLength;
         if (utf8Destination.Length < required)
@@ -188,12 +214,12 @@ public readonly struct InstructionDiscriminator :
         if (hasPrefix)
         {
             utf8Destination[0] = (byte)'0';
-            utf8Destination[1] = (byte)prefixChar;
-            ByteUtils.WriteHexUInt64Utf8(utf8Destination.Slice(2), _value, upperDigits ? ByteUtils.HexBytesUpper : ByteUtils.HexBytesLower);
+            utf8Destination[1] = (byte)'x';
+            HexCodec.Encode16(utf8Destination.Slice(2, HexLength), _value, upperDigits);
         }
         else
         {
-            ByteUtils.WriteHexUInt64Utf8(utf8Destination, _value, upperDigits ? ByteUtils.HexBytesUpper : ByteUtils.HexBytesLower);
+            HexCodec.Encode16(utf8Destination.Slice(0, HexLength), _value, upperDigits);
         }
 
         bytesWritten = required;
@@ -225,7 +251,11 @@ public readonly struct InstructionDiscriminator :
     /// <summary>
     /// Parses a discriminator using <see cref="ISpanParsable{TSelf}"/> semantics.
     /// </summary>
-    public static InstructionDiscriminator Parse(string s) => Parse(s.AsSpan(), CultureInfo.InvariantCulture);
+    public static InstructionDiscriminator Parse(string s)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        return Parse(s.AsSpan(), CultureInfo.InvariantCulture);
+    }
 
     /// <summary>
     /// Parses a discriminator using <see cref="ISpanParsable{TSelf}"/> semantics.
@@ -242,7 +272,11 @@ public readonly struct InstructionDiscriminator :
     /// <summary>
     /// Parses a discriminator using <see cref="ISpanParsable{TSelf}"/> semantics.
     /// </summary>
-    public static InstructionDiscriminator Parse(string s, IFormatProvider? provider) => Parse(s.AsSpan(), provider);
+    public static InstructionDiscriminator Parse(string s, IFormatProvider? provider)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        return Parse(s.AsSpan(), provider);
+    }
 
     /// <summary>
     /// Attempts to parse a discriminator literal from UTF-16 without throwing.
@@ -341,11 +375,20 @@ public readonly struct InstructionDiscriminator :
     /// </summary>
     public override bool Equals(object? obj) => obj is InstructionDiscriminator other && Equals(other);
 
+    /// <summary>Per-process random multiplier; see <see cref="HashSeed"/>.</summary>
+    private static readonly ulong s_hashMultiplier = HashSeed.NextOddMultiplier();
+
     /// <summary>
-    /// Returns a hash code suitable for hash tables.
+    /// Returns a hash code suitable for hash tables. It is randomised per process (multiply and fold), so it is not stable
+    /// across runs; discriminators come from untrusted instruction data, and a predictable hash lets crafted keys
+    /// collide in dictionary buckets.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public override int GetHashCode() => _value.GetHashCode();
+    public override int GetHashCode()
+    {
+        ulong h = _value * s_hashMultiplier;
+        return unchecked((int)((h >> 32) ^ h));
+    }
 
     /// <summary>
     /// Compares this discriminator to another discriminator.
@@ -387,70 +430,4 @@ public readonly struct InstructionDiscriminator :
     /// <summary>Greater-than-or-equal operator.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool operator >=(InstructionDiscriminator left, InstructionDiscriminator right) => left._value >= right._value;
-
-    /// <summary>
-    /// Shared format decoding for selector-like hex value types.
-    /// </summary>
-    internal static class FunctionSelectorFormat
-    {
-        /// <summary>
-        /// Decodes supported format strings: "", "x", "X", "0x", "0X".
-        /// </summary>
-        /// <param name="format">Format span.</param>
-        /// <param name="hasPrefix">True if output should include 0x/0X.</param>
-        /// <param name="uppercaseDigits">True for uppercase hex digits.</param>
-        /// <param name="prefixChar">'x' or 'X' when <paramref name="hasPrefix"/> is true.</param>
-        public static void Decode(ReadOnlySpan<char> format, out bool hasPrefix, out bool uppercaseDigits, out char prefixChar)
-        {
-            if (format.Length == 0)
-            {
-                hasPrefix = true;
-                uppercaseDigits = false;
-                prefixChar = 'x';
-                return;
-            }
-
-            if (format.Length == 1)
-            {
-                if (format[0] == 'x')
-                {
-                    hasPrefix = false;
-                    uppercaseDigits = false;
-                    prefixChar = 'x';
-                    return;
-                }
-
-                if (format[0] == 'X')
-                {
-                    hasPrefix = false;
-                    uppercaseDigits = true;
-                    prefixChar = 'X';
-                    return;
-                }
-            }
-            else if (format.Length == 2 && format[0] == '0')
-            {
-                if (format[1] == 'x')
-                {
-                    hasPrefix = true;
-                    uppercaseDigits = false;
-                    prefixChar = 'x';
-                    return;
-                }
-
-                if (format[1] == 'X')
-                {
-                    hasPrefix = true;
-                    uppercaseDigits = true;
-                    prefixChar = 'X';
-                    return;
-                }
-            }
-
-            ThrowHelper.ThrowFormatExceptionUnknownFormat(format);
-            hasPrefix = true;
-            uppercaseDigits = false;
-            prefixChar = 'x';
-        }
-    }
 }

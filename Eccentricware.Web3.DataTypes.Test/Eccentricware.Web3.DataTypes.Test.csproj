@@ -10,9 +10,11 @@
 
   <ItemGroup>
     <!-- Use MSTest v2 framework and adapter so Assert.ThrowsException<T> and other modern APIs are available -->
-    <PackageReference Include="MSTest.TestFramework" Version="4.0.2" />
-    <PackageReference Include="MSTest.TestAdapter" Version="4.0.2" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.10.0" />
+    <PackageReference Include="MSTest.TestFramework" Version="4.5.3" />
+    <PackageReference Include="MSTest.TestAdapter" Version="4.5.3" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.12.0" />
+    <!-- A real provider, so converter behaviour (stored bytes, ORDER BY, range filters, equality) is tested end to end. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.15" />
   </ItemGroup>
 
   <ItemGroup>

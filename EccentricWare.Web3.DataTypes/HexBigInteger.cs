@@ -5,6 +5,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json.Serialization;
 
 namespace EccentricWare.Web3.DataTypes;
@@ -110,12 +111,14 @@ public readonly struct HexBigInteger :
     }
 
     /// <summary>
-    /// Returns the number of bytes required to represent the magnitude.
+    /// Returns the number of bytes required to represent the magnitude (the absolute value). Zero reports 1, as <see cref="BigInteger.GetByteCount"/> does.
     /// </summary>
     public int MagnitudeByteCount
     {
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _value.GetByteCount(isUnsigned: true);
+        // GetByteCount(isUnsigned: true) throws for negative values, so negatives are measured on their absolute value.
+        get => _value.Sign >= 0
+            ? _value.GetByteCount(isUnsigned: true)
+            : BigInteger.Abs(_value).GetByteCount(isUnsigned: true);
     }
 
     #endregion
@@ -191,37 +194,107 @@ public readonly struct HexBigInteger :
 
     #endregion
 
-    #region Parsing (hot path: UTF-8 token normalisation + bounded decode)
+
+    #region Parsing (UTF-8: bounded; chars: ISpanParsable)
+
+    /// <summary>Scratch size for decoded magnitude bytes kept on the stack (up to 256 hex digits).</summary>
+    private const int StackMagnitudeBytes = 128;
 
     /// <summary>
     /// Parses a JSON-RPC-like UTF-8 token containing a hex quantity (quoted or unquoted), with DoS bounds.
     /// Accepts: <c>null</c>, <c>"0x..."</c>, <c>0x...</c>, <c>"-0x..."</c>.
+    /// A bare <c>0x</c> is zero; an empty token, or a sign with no digits, is rejected.
+    /// The sign may be <c>+</c> or <c>-</c> and may be followed by ASCII whitespace (<c>"- 0x1a"</c> is -26). The digit
+    /// count is checked against <paramref name="maxHexDigits"/> only; a hex prefix is optional.
     /// </summary>
     /// <param name="utf8Token">UTF-8 token.</param>
     /// <param name="result">Parsed value (zero for <c>null</c>).</param>
-    /// <param name="maxHexDigits">Maximum allowed hex digit count.</param>
+    /// <param name="maxHexDigits">Maximum allowed hex digit count; a negative value throws <see cref="ArgumentOutOfRangeException"/> (it used to disable the bound).</param>
     /// <returns>True if parsing succeeded; otherwise false.</returns>
     public static bool TryParseUtf8(ReadOnlySpan<byte> utf8Token, out HexBigInteger result, int maxHexDigits = DefaultMaxHexDigits)
     {
-        result = default;
+        ArgumentOutOfRangeException.ThrowIfNegative(maxHexDigits);
 
-        if (!ByteUtils.TryNormaliseHexTokenUtf8(utf8Token, out bool isNull, out bool isNegative, out var hexDigitsUtf8))
-            return false;
+        ReadOnlySpan<byte> trimmed = ByteUtils.TrimAsciiWhitespaceUtf8(utf8Token);
 
-        if (isNull)
+        if (trimmed.SequenceEqual("null"u8))
         {
             result = default; // zero; presence must be tracked externally if needed.
             return true;
         }
 
-        if (!ByteUtils.TryParseBigIntegerHexUnsignedUtf8(hexDigitsUtf8, maxHexDigits, out BigInteger magnitude))
+        // Quotes are optional here, unlike the JSON string path, where the reader has already removed them.
+        return TryParseQuantityUtf8(ByteUtils.TrimAsciiWhitespaceUtf8(ByteUtils.UnquoteJsonStringUtf8(trimmed)), maxHexDigits, out result);
+    }
+
+    /// <summary>
+    /// Parses the text of a JSON string (quotes already removed by the reader) with the default digit bound.
+    /// Unlike <see cref="TryParseUtf8"/>, quote characters and the text <c>null</c> are not accepted: neither is a quantity.
+    /// </summary>
+    internal static bool TryParseUnquoted(ReadOnlySpan<byte> utf8, out HexBigInteger result)
+        => TryParseQuantityUtf8(utf8, DefaultMaxHexDigits, out result);
+
+    private static bool TryParseQuantityUtf8(ReadOnlySpan<byte> utf8, int maxHexDigits, out HexBigInteger result)
+    {
+        result = default;
+
+        utf8 = ByteUtils.TrimAsciiWhitespaceUtf8(utf8);
+
+        bool isNegative = false;
+        if (!utf8.IsEmpty && (utf8[0] == (byte)'-' || utf8[0] == (byte)'+'))
+        {
+            isNegative = utf8[0] == (byte)'-';
+            utf8 = ByteUtils.TrimAsciiWhitespaceUtf8(utf8.Slice(1));
+        }
+
+        bool hasPrefix = ByteUtils.TryTrimHexPrefixUtf8(utf8, out ReadOnlySpan<byte> digits);
+        if (hasPrefix)
+            utf8 = digits;
+
+        // "0x" is zero; "", "-" and "+" carry no number at all.
+        if (utf8.IsEmpty)
+            return hasPrefix;
+
+        // Up to 16 digits fit one 64-bit limb: skip the byte decode and build the BigInteger from a ulong.
+        if (utf8.Length <= MaxLimbHexDigits)
+        {
+            if ((uint)utf8.Length > (uint)maxHexDigits)
+                return false;
+
+            ulong limb = 0;
+            foreach (byte digit in utf8)
+            {
+                int nibble = ByteUtils.ParseHexNibbleUtf8(digit);
+                if (nibble < 0)
+                    return false;
+
+                limb = (limb << 4) | (uint)nibble;
+            }
+
+            result = FromMagnitude(limb, isNegative);
+            return true;
+        }
+
+        if (!ByteUtils.TryParseBigIntegerHexUnsignedUtf8(utf8, maxHexDigits, out BigInteger magnitude))
             return false;
 
-        if (isNegative && magnitude != BigInteger.Zero)
-            magnitude = BigInteger.Negate(magnitude);
-
-        result = new HexBigInteger(magnitude);
+        result = new HexBigInteger(isNegative ? BigInteger.Negate(magnitude) : magnitude);
         return true;
+    }
+
+    /// <summary>Hex digits that fit one 64-bit limb.</summary>
+    private const int MaxLimbHexDigits = 16;
+
+    /// <summary>Builds a value from a 64-bit magnitude and a sign, allocating at most once (negating a multi-limb <see cref="BigInteger"/> copies it).</summary>
+    private static HexBigInteger FromMagnitude(ulong magnitude, bool isNegative)
+    {
+        if (!isNegative)
+            return new HexBigInteger(magnitude);
+
+        // Magnitudes up to 2^63 negate into a long; 0 stays 0.
+        return magnitude <= 1UL << 63
+            ? new HexBigInteger(unchecked((long)(0UL - magnitude)))
+            : new HexBigInteger(BigInteger.Negate(new BigInteger(magnitude)));
     }
 
     /// <summary>
@@ -237,10 +310,6 @@ public readonly struct HexBigInteger :
         throw new FormatException("Invalid hex quantity token.");
     }
 
-    #endregion
-
-    #region Parsing (ISpanParsable / chars)
-
     /// <inheritdoc />
     public static HexBigInteger Parse(ReadOnlySpan<char> s, IFormatProvider? provider)
     {
@@ -250,45 +319,78 @@ public readonly struct HexBigInteger :
         throw new FormatException("Invalid hexadecimal string.");
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Parses optional whitespace, an optional sign, an optional <c>0x</c>/<c>0X</c> prefix and hex digits; the input is always
+    /// hexadecimal. The digits are decoded to bytes and read as an unsigned magnitude, because
+    /// <see cref="NumberStyles.HexNumber"/> in <see cref="BigInteger"/> parsing reads <c>ff</c> as -1.
+    /// Length is not bounded here; use <see cref="TryParseUtf8"/> for untrusted input.
+    /// </summary>
     public static bool TryParse(ReadOnlySpan<char> s, IFormatProvider? provider, out HexBigInteger result)
     {
         result = default;
 
         s = ByteUtils.TrimAsciiWhitespace(s);
 
-        if (s.IsEmpty)
-            return false;
-
-        if (!ByteUtils.TryTrimLeadingSign(s, out bool isNegative, out var unsignedSpan))
-            return false;
-
-        unsignedSpan = ByteUtils.TrimAsciiWhitespace(unsignedSpan);
-
-        if (ByteUtils.TryTrimHexPrefix(unsignedSpan, out var afterPrefix))
-            unsignedSpan = afterPrefix;
-
-        if (unsignedSpan.IsEmpty)
+        bool isNegative = false;
+        if (!s.IsEmpty && (s[0] == '-' || s[0] == '+'))
         {
-            result = default;
+            isNegative = s[0] == '-';
+            s = ByteUtils.TrimAsciiWhitespace(s.Slice(1));
+        }
+
+        bool hasPrefix = ByteUtils.TryTrimHexPrefix(s, out ReadOnlySpan<char> digits);
+        if (hasPrefix)
+            s = digits;
+
+        // "0x" is zero; "", "-" and "+" carry no number at all.
+        if (s.IsEmpty)
+            return hasPrefix;
+
+        if (s.Length <= MaxLimbHexDigits)
+        {
+            ulong limb = 0;
+            foreach (char digit in s)
+            {
+                int nibble = ByteUtils.ParseHexNibble(digit);
+                if (nibble < 0)
+                    return false;
+
+                limb = (limb << 4) | (uint)nibble;
+            }
+
+            result = FromMagnitude(limb, isNegative);
             return true;
         }
 
-        if (!ByteUtils.IsAllHexChars(unsignedSpan))
-            return false;
+        int requiredBytes = (s.Length + 1) >> 1;
+        byte[]? rented = null;
 
-        if (!BigInteger.TryParse(unsignedSpan, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var magnitude))
-            return false;
+        try
+        {
+            Span<byte> magnitudeBigEndian = requiredBytes <= StackMagnitudeBytes
+                ? stackalloc byte[StackMagnitudeBytes]
+                : (rented = ArrayPool<byte>.Shared.Rent(requiredBytes));
 
-        if (isNegative && magnitude != BigInteger.Zero)
-            magnitude = BigInteger.Negate(magnitude);
+            if (!ByteUtils.TryDecodeHexChars(s, magnitudeBigEndian, out int bytesWritten, allowOddLength: true))
+                return false;
 
-        result = new HexBigInteger(magnitude);
-        return true;
+            var magnitude = new BigInteger(magnitudeBigEndian.Slice(0, bytesWritten), isUnsigned: true, isBigEndian: true);
+            result = new HexBigInteger(isNegative ? BigInteger.Negate(magnitude) : magnitude);
+            return true;
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     /// <inheritdoc />
-    public static HexBigInteger Parse(string s, IFormatProvider? provider) => Parse(s.AsSpan(), provider);
+    public static HexBigInteger Parse(string s, IFormatProvider? provider)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        return Parse(s.AsSpan(), provider);
+    }
 
     /// <inheritdoc />
     public static bool TryParse([NotNullWhen(true)] string? s, IFormatProvider? provider, out HexBigInteger result)
@@ -304,203 +406,258 @@ public readonly struct HexBigInteger :
 
     #endregion
 
-    #region Formatting (hot path: bytes -> hex; cold path: ToString)
+    #region Formatting
+
+    /// <summary>Scratch size for formatted text kept on the stack; larger outputs use pooled buffers.</summary>
+    private const int StackFormatBytes = 256;
+
+    /// <summary>
+    /// Upper bound on the length of any hex rendering ("-", "0x", then two digits per magnitude byte).
+    /// <see cref="BigInteger.GetBitLength"/> excludes the sign bit, so a negative power of two is one bit short; the
+    /// +8 absorbs that. O(1): no allocation, no copy.
+    /// </summary>
+    private int MaxHexUtf8Length => 3 + (2 * (int)((_value.GetBitLength() + 8) >> 3));
+
+    /// <summary>
+    /// Understands the formats shared by <see cref="ToString(string?, IFormatProvider?)"/> and both <c>TryFormat</c> overloads:
+    /// empty or <c>0x</c>/<c>0X</c> (prefixed hex), <c>x</c>/<c>X</c> (bare hex), <c>d</c>/<c>D</c> (decimal).
+    /// The prefix is always lowercase <c>0x</c>; the letter case follows the format.
+    /// </summary>
+    private static bool TryParseFormat(ReadOnlySpan<char> format, out bool decimalOutput, out bool withPrefix, out bool uppercase)
+    {
+        decimalOutput = false;
+        withPrefix = false;
+        uppercase = false;
+
+        switch (format.Length)
+        {
+            case 0:
+                withPrefix = true;
+                return true;
+
+            case 1:
+                switch (format[0])
+                {
+                    case 'x': return true;
+                    case 'X': uppercase = true; return true;
+                    case 'd':
+                    case 'D': decimalOutput = true; return true;
+                    default: return false;
+                }
+
+            case 2 when format[0] == '0' && (format[1] == 'x' || format[1] == 'X'):
+                withPrefix = true;
+                uppercase = format[1] == 'X';
+                return true;
+
+            default:
+                return false;
+        }
+    }
 
     /// <inheritdoc />
-    public override string ToString() => ToString("0x", CultureInfo.InvariantCulture);
+    public override string ToString() => ToString(string.Empty, CultureInfo.InvariantCulture);
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Formats the value. Supported formats: empty/<c>null</c> or <c>0x</c>/<c>0X</c> (prefixed hex), <c>x</c>/<c>X</c> (hex),
+    /// <c>d</c>/<c>D</c> (decimal). Output is always ASCII and culture-invariant; <paramref name="formatProvider"/> is ignored.
+    /// </summary>
+    /// <exception cref="FormatException">The format is not supported.</exception>
     public string ToString(string? format, IFormatProvider? formatProvider)
     {
-        format ??= "0x";
-
-        if (format is "d" or "D")
-            return _value.ToString(CultureInfo.InvariantCulture);
-
-        bool uppercase = format is "X" or "0X";
-        bool withPrefix = format is "0x" or "0X" || format.Length == 0;
-        bool rawHex = format is "x" or "X";
-
-        if (!(withPrefix || rawHex))
+        if (!TryParseFormat(format, out bool decimalOutput, out bool withPrefix, out bool uppercase))
             throw new FormatException($"Unknown format: {format}");
 
-        // Cold path: string allocation is acceptable here.
-        if (_value.IsZero)
-            return withPrefix ? "0x0" : "0";
+        if (decimalOutput)
+            return _value.ToString(CultureInfo.InvariantCulture);
 
-        if (_value.Sign < 0)
+        int capacity = MaxHexUtf8Length;
+        byte[]? rented = null;
+
+        try
         {
-            string absHex = BigInteger.Abs(_value).ToString(uppercase ? "X" : "x", CultureInfo.InvariantCulture);
-            return withPrefix ? "-0x" + absHex : "-" + absHex;
-        }
+            Span<byte> utf8 = capacity <= StackFormatBytes
+                ? stackalloc byte[StackFormatBytes]
+                : (rented = ArrayPool<byte>.Shared.Rent(capacity));
 
-        string hex = _value.ToString(uppercase ? "X" : "x", CultureInfo.InvariantCulture);
-        return withPrefix ? "0x" + hex : hex;
+            if (!TryFormatHex(utf8, withPrefix, uppercase, out int written))
+                throw new InvalidOperationException("Hex output exceeded its computed upper bound.");
+
+            return Encoding.ASCII.GetString(utf8.Slice(0, written));
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     /// <inheritdoc />
     public bool TryFormat(Span<char> destination, out int charsWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        // For simplicity and correctness, route char formatting through UTF-8 formatting (ASCII subset).
-        Span<byte> tmpUtf8 = stackalloc byte[Math.Min(512, destination.Length)];
-        if (!TryFormat(tmpUtf8, out int bytesWritten, format, provider))
-        {
-            charsWritten = 0;
-            return false;
-        }
+        charsWritten = 0;
 
-        if (bytesWritten > destination.Length)
-        {
-            charsWritten = 0;
-            return false;
-        }
+        if (!TryParseFormat(format, out bool decimalOutput, out bool withPrefix, out bool uppercase))
+            ThrowHelper.ThrowFormatExceptionUnknownFormat(format);
 
-        for (int i = 0; i < bytesWritten; i++)
-            destination[i] = (char)tmpUtf8[i];
+        if (decimalOutput)
+            return _value.TryFormat(destination, out charsWritten, "d", CultureInfo.InvariantCulture);
 
-        charsWritten = bytesWritten;
-        return true;
-    }
-
-
-    public bool TryFormat(
-     Span<byte> utf8Destination,
-     out int bytesWritten,
-     ReadOnlySpan<char> format = default,
-     IFormatProvider? provider = null)
-    {
-        bytesWritten = 0;
-
-        // Decimal path: BigInteger only supports Span<char> formatting.
-        bool wantsDecimal = format.Length == 1 && (format[0] == 'd' || format[0] == 'D');
-        if (wantsDecimal)
-        {
-            int charCapacity = utf8Destination.Length;
-            if (charCapacity == 0)
-                return false;
-
-            const int StackCharLimit = 256;
-            char[]? rentedChars = null;
-
-            try
-            {
-                Span<char> charBuffer = charCapacity <= StackCharLimit
-                    ? stackalloc char[charCapacity]
-                    : (rentedChars = ArrayPool<char>.Shared.Rent(charCapacity));
-
-                if (rentedChars is not null)
-                    charBuffer = charBuffer.Slice(0, charCapacity);
-
-                if (!_value.TryFormat(charBuffer, out int charsWritten, format, provider))
-                    return false;
-
-                if ((uint)charsWritten > (uint)utf8Destination.Length)
-                    return false;
-
-                // Decimal output is ASCII; direct cast is safe.
-                for (int i = 0; i < charsWritten; i++)
-                    utf8Destination[i] = (byte)charBuffer[i];
-
-                bytesWritten = charsWritten;
-                return true;
-            }
-            finally
-            {
-                if (rentedChars is not null)
-                    ArrayPool<char>.Shared.Return(rentedChars);
-            }
-        }
-
-        // Hex path.
-        bool withPrefix;
-        bool uppercase;
-
-        if (format.Length == 0)
-        {
-            // Default: "0x" prefixed, lowercase.
-            withPrefix = true;
-            uppercase = false;
-        }
-        else if (format.Length == 1)
-        {
-            char f = format[0];
-            if (f == 'x')
-            {
-                withPrefix = false;
-                uppercase = false;
-            }
-            else if (f == 'X')
-            {
-                withPrefix = false;
-                uppercase = true;
-            }
-            else
-            {
-                return false;
-            }
-        }
-        else if (format.Length == 2)
-        {
-            // "0x" / "0X"
-            if (format[0] != '0' || (format[1] != 'x' && format[1] != 'X'))
-                return false;
-
-            withPrefix = true;
-            uppercase = (format[1] == 'X');
-        }
-        else
-        {
-            return false;
-        }
-
-        // Zero: fast constant output.
-        if (_value.IsZero)
-        {
-            if (withPrefix)
-            {
-                if (utf8Destination.Length < 3) return false;
-                utf8Destination[0] = (byte)'0';
-                utf8Destination[1] = (byte)'x';
-                utf8Destination[2] = (byte)'0';
-                bytesWritten = 3;
-                return true;
-            }
-
-            if (utf8Destination.Length < 1) return false;
-            utf8Destination[0] = (byte)'0';
-            bytesWritten = 1;
-            return true;
-        }
-
-        int pos = 0;
-
-        // Leading '-' for negative values.
-        bool isNegative = _value.Sign < 0;
-        BigInteger absValue = isNegative ? BigInteger.Abs(_value) : _value;
-
-        if (isNegative)
-        {
-            if (utf8Destination.Length < 1)
-                return false;
-
-            utf8Destination[pos++] = (byte)'-';
-        }
-
-        int magnitudeByteCount = absValue.GetByteCount(isUnsigned: true);
-        if (magnitudeByteCount == 0)
-            magnitudeByteCount = 1;
-
-        const int StackByteLimit = 128;
-        byte[]? rentedBytes = null;
+        // Output is ASCII, so it is formatted as UTF-8 into scratch sized to the longest possible rendering (not to the
+        // destination, which may be far larger or smaller) and widened.
+        int capacity = Math.Min(destination.Length, MaxHexUtf8Length);
+        byte[]? rented = null;
 
         try
         {
-            Span<byte> magnitudeBigEndian = magnitudeByteCount <= StackByteLimit
-                ? stackalloc byte[magnitudeByteCount]
-                : (rentedBytes = ArrayPool<byte>.Shared.Rent(magnitudeByteCount));
+            Span<byte> utf8 = capacity <= StackFormatBytes
+                ? stackalloc byte[StackFormatBytes]
+                : (rented = ArrayPool<byte>.Shared.Rent(capacity));
 
-            if (rentedBytes is not null)
-                magnitudeBigEndian = magnitudeBigEndian.Slice(0, magnitudeByteCount);
+            if (!TryFormatHex(utf8.Slice(0, capacity), withPrefix, uppercase, out int written))
+                return false;
+
+            Ascii.ToUtf16(utf8.Slice(0, written), destination, out _);
+            charsWritten = written;
+            return true;
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// Formats directly to UTF-8. Supports the same formats as <see cref="ToString(string?, IFormatProvider?)"/>;
+    /// returns false for a destination that is too small and throws <see cref="FormatException"/> for an unsupported format,
+    /// like <see cref="ToString(string?, IFormatProvider?)"/> and <see cref="HexBytes"/>. The provider is ignored.
+    /// </summary>
+    public bool TryFormat(
+        Span<byte> utf8Destination,
+        out int bytesWritten,
+        ReadOnlySpan<char> format = default,
+        IFormatProvider? provider = null)
+    {
+        bytesWritten = 0;
+
+        if (!TryParseFormat(format, out bool decimalOutput, out bool withPrefix, out bool uppercase))
+            ThrowHelper.ThrowFormatExceptionUnknownFormat(format);
+
+        return decimalOutput
+            ? TryFormatDecimal(utf8Destination, out bytesWritten)
+            : TryFormatHex(utf8Destination, withPrefix, uppercase, out bytesWritten);
+    }
+
+    /// <summary>Decimal output. <see cref="BigInteger"/> only formats to chars, so this goes through a char scratch buffer.</summary>
+    private bool TryFormatDecimal(Span<byte> utf8Destination, out int bytesWritten)
+    {
+        bytesWritten = 0;
+
+        // A value of b bits has at most floor(b * log10(2)) + 1 digits; +3 covers the sign and the negative power-of-two
+        // bit-length quirk. Sizing the scratch to the value, not the destination, keeps a large output buffer from
+        // forcing a large rental.
+        long maxChars = (long)(_value.GetBitLength() * 0.30103) + 3;
+        int charCapacity = (int)Math.Min(utf8Destination.Length, maxChars);
+        if (charCapacity == 0)
+            return false;
+
+        char[]? rented = null;
+
+        try
+        {
+            Span<char> chars = charCapacity <= StackFormatBytes
+                ? stackalloc char[StackFormatBytes]
+                : (rented = ArrayPool<char>.Shared.Rent(charCapacity));
+
+            if (!_value.TryFormat(chars.Slice(0, charCapacity), out int charsWritten, "d", CultureInfo.InvariantCulture))
+                return false;
+
+            // Invariant decimal is ASCII, so narrowing is exact.
+            Ascii.FromUtf16(chars.Slice(0, charsWritten), utf8Destination, out _);
+            bytesWritten = charsWritten;
+            return true;
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<char>.Shared.Return(rented);
+        }
+    }
+
+    private static bool TryFormatLimb(ulong magnitude, bool isNegative, bool withPrefix, bool uppercase, Span<byte> destination, out int bytesWritten)
+    {
+        bytesWritten = 0;
+        int pos = 0;
+
+        // Sign and prefix are written only once the whole output is known to fit, so a failed call writes nothing.
+        int digitCount = magnitude == 0 ? 1 : ((64 - System.Numerics.BitOperations.LeadingZeroCount(magnitude)) + 3) >> 2;
+        int total = (isNegative ? 1 : 0) + (withPrefix ? 2 : 0) + digitCount;
+        if (destination.Length < total)
+            return false;
+
+        if (isNegative)
+            destination[pos++] = (byte)'-';
+
+        if (withPrefix)
+        {
+            destination[pos++] = (byte)'0';
+            destination[pos++] = (byte)'x';
+        }
+
+        // Digits are written from the least significant end; the count is already known.
+        ReadOnlySpan<byte> alphabet = uppercase ? ByteUtils.HexBytesUpper : ByteUtils.HexBytesLower;
+        for (int i = pos + digitCount - 1; i >= pos; i--)
+        {
+            destination[i] = alphabet[(int)(magnitude & 0xF)];
+            magnitude >>= 4;
+        }
+
+        bytesWritten = total;
+        return true;
+    }
+
+    /// <summary>Minimal hex output ("0x1a", "-0xFF", "0"): sign, optional prefix, no leading zero digits.</summary>
+    private bool TryFormatHex(Span<byte> utf8Destination, bool withPrefix, bool uppercase, out int bytesWritten)
+    {
+        bytesWritten = 0;
+
+        if (_value.IsZero)
+        {
+            ReadOnlySpan<byte> zero = withPrefix ? "0x0"u8 : "0"u8;
+            if (utf8Destination.Length < zero.Length)
+                return false;
+
+            zero.CopyTo(utf8Destination);
+            bytesWritten = zero.Length;
+            return true;
+        }
+
+        bool isNegative = _value.Sign < 0;
+
+        // Magnitude within 64 bits (the common JSON-RPC quantity): format the ulong, no byte round-trip through BigInteger.
+        // GetBitLength excludes the sign bit, so a negative value of up to 63 bits has a magnitude of at most 2^63.
+        long bitLength = _value.GetBitLength();
+        if (isNegative ? bitLength <= 63 : bitLength <= 64)
+        {
+            ulong magnitude = isNegative ? 0UL - unchecked((ulong)(long)_value) : (ulong)_value;
+            return TryFormatLimb(magnitude, isNegative, withPrefix, uppercase, utf8Destination, out bytesWritten);
+        }
+
+        BigInteger absValue = isNegative ? BigInteger.Abs(_value) : _value;
+
+        int pos = isNegative ? 1 : 0;
+        if (utf8Destination.Length < pos)
+            return false;
+
+        int magnitudeByteCount = absValue.GetByteCount(isUnsigned: true);
+        byte[]? rented = null;
+
+        try
+        {
+            Span<byte> magnitudeBigEndian = magnitudeByteCount <= StackMagnitudeBytes
+                ? stackalloc byte[StackMagnitudeBytes]
+                : (rented = ArrayPool<byte>.Shared.Rent(magnitudeByteCount));
 
             if (!absValue.TryWriteBytes(magnitudeBigEndian, out int written, isUnsigned: true, isBigEndian: true))
                 return false;
@@ -515,13 +672,17 @@ public readonly struct HexBigInteger :
                 return false;
             }
 
+            // The sign goes in last so that a failed call leaves the destination untouched.
+            if (isNegative)
+                utf8Destination[0] = (byte)'-';
+
             bytesWritten = pos + hexBytesWritten;
             return true;
         }
         finally
         {
-            if (rentedBytes is not null)
-                ArrayPool<byte>.Shared.Return(rentedBytes);
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
         }
     }
 

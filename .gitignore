@@ -1,5 +1,10 @@
 .vs
-EccentricWare.Web3.DataTypes/bin
-EccentricWare.Web3.DataTypes/obj
-EccentricWare.Web3.DataTypes.Test/bin
-EccentricWare.Web3.DataTypes.Test/obj
+EccentricWare.Web3.DataTypes/bin/*
+EccentricWare.Web3.DataTypes/obj/*
+Eccentricware.Web3.DataTypes.Test/bin
+Eccentricware.Web3.DataTypes.Test/obj
+EccentricWare.Web3.DataTypes.Benchmarks/bin
+EccentricWare.Web3.DataTypes.Benchmarks/obj
+BenchmarkDotNet.Artifacts/
+
+.vscode

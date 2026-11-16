@@ -1,11 +1,13 @@
 using EccentricWare.Web3.DataTypes.JsonConverters;
 using EccentricWare.Web3.DataTypes.Utils;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Text;
 using System.Text.Json.Serialization;
 
 namespace EccentricWare.Web3.DataTypes;
@@ -32,7 +34,7 @@ public enum AddressType : byte
 /// <remarks>
 /// <para>
 /// Storage layout is optimised for hot-path comparisons and dictionary keys:
-/// 32 bytes of data (4 x ulong) + 1 byte <see cref="AddressType"/> + 7 bytes padding = 40 bytes.
+/// 32 bytes of data (4 x ulong) + 1 byte <see cref="AddressType"/>, padded to 40 bytes by the 8-byte alignment of the limbs.
 /// </para>
 /// <para>
 /// For EVM addresses, only the first 20 bytes are used; the remaining 12 bytes are zero.
@@ -71,15 +73,6 @@ public readonly struct Address :
 
     private readonly AddressType _type;
 
-    // Explicit padding to lock the struct size at 40 bytes and keep layout stable for bulk matchers.
-    private readonly byte _pad0;
-    private readonly byte _pad1;
-    private readonly byte _pad2;
-    private readonly byte _pad3;
-    private readonly byte _pad4;
-    private readonly byte _pad5;
-    private readonly byte _pad6;
-
     /// <summary>A zero EVM address (<c>0x000…000</c>).</summary>
     public static readonly Address ZeroEvm = new(0, 0, 0, 0, AddressType.Evm);
 
@@ -97,8 +90,19 @@ public readonly struct Address :
         _u2 = u2;
         _u3 = u3Lsb;
         _type = addressType;
+    }
 
-        _pad0 = _pad1 = _pad2 = _pad3 = _pad4 = _pad5 = _pad6 = 0;
+    /// <summary>
+    /// Returns the four big-endian 64-bit words of the 32-byte backing value (the family is separate, see <see cref="Type"/>).
+    /// Lets <see cref="AddressSet"/> read keys without depending on the struct's memory layout.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void GetLimbs(out ulong u0, out ulong u1, out ulong u2, out ulong u3)
+    {
+        u0 = _u0;
+        u1 = _u1;
+        u2 = _u2;
+        u3 = _u3;
     }
 
     /// <summary>Returns the address family.</summary>
@@ -198,7 +202,18 @@ public readonly struct Address :
     public override bool Equals(object? obj) => obj is Address other && Equals(other);
 
     /// <inheritdoc/>
-    public override int GetHashCode() => HashCode.Combine(_u0, _u1, _u2, _u3, (byte)_type);
+    public override int GetHashCode()
+    {
+        // Keyed per process (see Hash256) because addresses come from untrusted transactions. The family is mixed in AFTER
+        // the keyed hash, so equal payloads of different families hash differently. Folding it into the last limb instead
+        // (u3 ^ family) let an EVM address collide with the Solana key that has the same first three limbs and a last limb
+        // of 1, because the XOR cancels.
+        int hash = Hash256.Compute(_u0, _u1, _u2, _u3);
+        return _type == AddressType.Evm ? hash : hash ^ SolanaHashSalt;
+    }
+
+    /// <summary>Non-zero constant XORed into the hash of a Solana address (the golden-ratio multiplier, truncated to 32 bits).</summary>
+    private const int SolanaHashSalt = unchecked((int)0x9E3779B9);
 
     /// <summary>Returns true if two addresses are equal.</summary>
     public static bool operator ==(Address left, Address right) => left.Equals(right);
@@ -254,18 +269,18 @@ public readonly struct Address :
     /// <item><description>Otherwise, try canonical Base58=>32 => Solana</description></item>
     /// <item><description>Otherwise, if length is 40 and all hex => EVM</description></item>
     /// </list>
+    /// <para>
+    /// The unprefixed 40-digit form is ambiguous only for text that starts with at least seven <c>1</c> digits and has no
+    /// <c>0</c>: such text can be a canonical Base58 Solana key and is parsed as one. Write the <c>0x</c> prefix when an
+    /// EVM address may begin that way. Mixed-case hex is accepted without verifying its EIP-55 checksum.
+    /// </para>
     /// </summary>
-    public static Address Parse(ReadOnlySpan<char> text)
-    {
-        if (!TryParse(text, out Address value))
-            ThrowHelper.ThrowFormatExceptionInvalidAddress();
-        return value;
-    }
+    public static Address Parse(ReadOnlySpan<char> text) => Parse(text, CultureInfo.InvariantCulture);
 
     /// <summary>
     /// Parses an address from a string using invariant parsing rules.
     /// </summary>
-    public static Address Parse(string text) => Parse(text.AsSpan());
+    public static Address Parse(string text) => Parse(text, CultureInfo.InvariantCulture);
 
     /// <summary>
     /// Tries to parse an address from characters without throwing.
@@ -285,17 +300,18 @@ public readonly struct Address :
             goto Fail;
         }
 
-        // Solana: attempt canonical Base58->32 if in plausible length range (includes the ambiguous 40-char case).
+        // 40 characters without a prefix: hex, or (rarely) Base58.
+        if (text.Length == EvmHexLength)
+        {
+            if (TryParseBare40Chars(text, out value))
+                return true;
+            goto Fail;
+        }
+
+        // Solana: attempt canonical Base58->32 if in plausible length range.
         if ((uint)(text.Length - 32) <= (MaxBase58Length - 32))
         {
             if (TryParseSolanaBase58Chars(text, out value))
-                return true;
-        }
-
-        // EVM: 40 hex without prefix (fallback only, to avoid misclassifying Base58-like inputs).
-        if (text.Length == EvmHexLength && ByteUtils.IsAllHexChars(text))
-        {
-            if (TryParseEvmHexChars(text, out value))
                 return true;
         }
 
@@ -333,10 +349,23 @@ public readonly struct Address :
     /// </summary>
     public static bool TryParse(ReadOnlySpan<byte> utf8, out Address value)
     {
-        Unsafe.SkipInit(out value);
-
         if (!ByteUtils.TryUnquoteJsonUtf8(utf8, out ReadOnlySpan<byte> unquoted))
-            goto Fail;
+        {
+            value = default;
+            return false;
+        }
+
+        return TryParseUnquotedUtf8(unquoted, out value);
+    }
+
+    /// <summary>
+    /// Parses UTF-8 text that is already unquoted (a JSON string token's contents). Unlike
+    /// <see cref="TryParse(ReadOnlySpan{byte}, out Address)"/> it does not strip surrounding quote characters, so a
+    /// value that merely contains quotes is rejected.
+    /// </summary>
+    internal static bool TryParseUnquotedUtf8(ReadOnlySpan<byte> unquoted, out Address value)
+    {
+        Unsafe.SkipInit(out value);
 
         // EVM: 0x + 40 hex
         if (unquoted.Length == 42 &&
@@ -348,17 +377,18 @@ public readonly struct Address :
             goto Fail;
         }
 
+        // 40 bytes without a prefix: hex, or (rarely) Base58.
+        if (unquoted.Length == EvmHexLength)
+        {
+            if (TryParseBare40Utf8(unquoted, out value))
+                return true;
+            goto Fail;
+        }
+
         // Solana: attempt canonical Base58->32 in plausible length range.
         if ((uint)(unquoted.Length - 32) <= (MaxBase58Length - 32))
         {
             if (TryParseSolanaBase58Utf8(unquoted, out value))
-                return true;
-        }
-
-        // EVM: 40 hex without prefix.
-        if (unquoted.Length == EvmHexLength && ByteUtils.IsAllHexUtf8(unquoted))
-        {
-            if (TryParseEvmHexUtf8(unquoted, out value))
                 return true;
         }
 
@@ -368,13 +398,22 @@ public readonly struct Address :
     }
 
     /// <summary>ISpanParsable required method; the format provider is ignored.</summary>
-    public static Address Parse(ReadOnlySpan<char> s, IFormatProvider? provider) => Parse(s);
+    public static Address Parse(ReadOnlySpan<char> s, IFormatProvider? provider)
+    {
+        if (!TryParse(s, out Address value))
+            ThrowHelper.ThrowFormatExceptionInvalidAddress();
+        return value;
+    }
 
     /// <summary>ISpanParsable required method; the format provider is ignored.</summary>
     public static bool TryParse(ReadOnlySpan<char> s, IFormatProvider? provider, out Address result) => TryParse(s, out result);
 
     /// <summary>ISpanParsable required method; the format provider is ignored.</summary>
-    public static Address Parse(string s, IFormatProvider? provider) => Parse(s.AsSpan(), provider);
+    public static Address Parse(string s, IFormatProvider? provider)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        return Parse(s.AsSpan(), provider);
+    }
 
     /// <summary>ISpanParsable required method; the format provider is ignored.</summary>
     public static bool TryParse([NotNullWhen(true)] string? s, IFormatProvider? provider, out Address result)
@@ -388,7 +427,37 @@ public readonly struct Address :
         return TryParse(s.AsSpan(), out result);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    /// <summary>
+    /// Parses exactly 40 characters with no <c>0x</c> prefix: EVM hex, unless the text is a canonical Base58 Solana key.
+    /// </summary>
+    /// <remarks>
+    /// Base58 is only worth trying when it can succeed. A 40-character Base58 string with k leading '1's has at most
+    /// ceil((40 - k) * log2(58) / 8) significant bytes, but a canonical 32-byte value needs 32 - k, which fails for every
+    /// k below 7. So fewer than seven leading '1's, or any '0' (not a Base58 digit), means hex only. That skips a failed
+    /// Base58 decode (about 55 ns) for the 8% of addresses that contain no '0'. Kept out of line so the hot prefixed path
+    /// in <see cref="TryParse(ReadOnlySpan{char}, out Address)"/> stays small; inlining it cost that path about 40%.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool TryParseBare40Chars(ReadOnlySpan<char> text, out Address value)
+    {
+        if (text.StartsWith("1111111") && !text.Contains('0') && TryParseSolanaBase58Chars(text, out value))
+            return true;
+
+        return TryParseEvmHexChars(text, out value);
+    }
+
+    /// <summary>UTF-8 counterpart of <see cref="TryParseBare40Chars"/>.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool TryParseBare40Utf8(ReadOnlySpan<byte> utf8, out Address value)
+    {
+        if (utf8.StartsWith("1111111"u8) && !utf8.Contains((byte)'0') && TryParseSolanaBase58Utf8(utf8, out value))
+            return true;
+
+        return TryParseEvmHexUtf8(utf8, out value);
+    }
+
+    // Not inlined, for the same reason as TryParseEvmHexUtf8.
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private static bool TryParseEvmHexChars(ReadOnlySpan<char> hex40, out Address value)
     {
         Unsafe.SkipInit(out value);
@@ -404,7 +473,10 @@ public readonly struct Address :
         return true;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    // Not inlined: the caller already inlines the JSON unquoting and the Base58 branch, and past the JIT's inline budget the
+    // hex decode and constructor turn into real calls inside the caller (prefixed parse measured 19 ns against 11 ns for
+    // this method called whole). As a method of its own everything in it inlines.
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private static bool TryParseEvmHexUtf8(ReadOnlySpan<byte> hex40Utf8, out Address value)
     {
         Unsafe.SkipInit(out value);
@@ -420,7 +492,8 @@ public readonly struct Address :
         return true;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    // Not inlined: the Base58 decode dwarfs any call overhead, and inlining it grew the caller's frame (and its zeroed
+    // prolog) for every call, including the common 0x-prefixed hex path that never reaches it.
     private static bool TryParseSolanaBase58Utf8(ReadOnlySpan<byte> base58Utf8, out Address value)
     {
         Unsafe.SkipInit(out value);
@@ -432,22 +505,16 @@ public readonly struct Address :
         return true;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool TryParseSolanaBase58Chars(ReadOnlySpan<char> base58Chars, out Address value)
     {
         Unsafe.SkipInit(out value);
 
-        // Convert to ASCII bytes on stack; reject non-ASCII early.
+        // Narrow to ASCII on the stack; the Base58 alphabet is ASCII, so any other character is a failure.
         Span<byte> tmp = stackalloc byte[MaxBase58Length];
-        for (int i = 0; i < base58Chars.Length; i++)
-        {
-            char c = base58Chars[i];
-            if (c > 0x7F) // Base58 alphabet is ASCII
-                return false;
-            tmp[i] = (byte)c;
-        }
+        if (Ascii.FromUtf16(base58Chars, tmp, out int written) != OperationStatus.Done)
+            return false;
 
-        return TryParseSolanaBase58Utf8(tmp.Slice(0, base58Chars.Length), out value);
+        return TryParseSolanaBase58Utf8(tmp.Slice(0, written), out value);
     }
 
     // -------------------------
@@ -471,7 +538,7 @@ public readonly struct Address :
     /// <summary>
     /// Formats the address.
     /// <list type="bullet">
-    /// <item><description>EVM supports: <c>"0x"</c>, <c>"0X"</c>, <c>"x"</c>, <c>"X"</c>, <c>"c"</c>/<c>"C"</c> (EIP-55 checksum).</description></item>
+    /// <item><description>EVM supports: <c>"0x"</c>, <c>"0X"</c> (uppercase digits), <c>"x"</c>, <c>"X"</c> (uppercase digits), <c>"c"</c>/<c>"C"</c> (EIP-55 checksum). The prefix, when written, is always a lowercase <c>0x</c>.</description></item>
     /// <item><description>Solana ignores the format and returns Base58.</description></item>
     /// </list>
     /// </summary>
@@ -481,7 +548,7 @@ public readonly struct Address :
 
         ReadOnlySpan<char> f = format is null ? default : format.AsSpan();
         if (!TryFormat(buffer, out int written, f, formatProvider))
-            throw new FormatException(nameof(format));
+            ThrowHelper.ThrowFormatExceptionUnknownFormat(f);
 
         return new string(buffer.Slice(0, written));
     }
@@ -502,8 +569,7 @@ public readonly struct Address :
                 return false;
             }
 
-            for (int i = 0; i < len; i++)
-                destination[i] = (char)tmp[i];
+            Ascii.ToUtf16(tmp.Slice(0, len), destination, out _);
 
             charsWritten = len;
             return true;
@@ -531,7 +597,7 @@ public readonly struct Address :
         if (evmFormat.WithPrefix)
         {
             destination[0] = '0';
-            destination[1] = evmFormat.PrefixUppercase ? 'X' : 'x';
+            destination[1] = 'x';
             offset = 2;
         }
 
@@ -580,7 +646,7 @@ public readonly struct Address :
         if (evmFormat.WithPrefix)
         {
             utf8Destination[0] = (byte)'0';
-            utf8Destination[1] = evmFormat.PrefixUppercase ? (byte)'X' : (byte)'x';
+            utf8Destination[1] = (byte)'x';
             offset = 2;
         }
 
@@ -616,16 +682,42 @@ public readonly struct Address :
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void WriteEvmHexUtf8(Span<byte> hex40Utf8, bool uppercase)
     {
-        ReadOnlySpan<byte> alphabet = uppercase ? ByteUtils.HexBytesUpper : ByteUtils.HexBytesLower;
+        // Same layout as WriteEvmHexChars: _u0 (16 hex) + _u1 (16 hex) + upper 32 bits of _u2 (8 hex).
+        HexCodec.Encode16(hex40Utf8.Slice(0, 16), _u0, uppercase);
+        HexCodec.Encode16(hex40Utf8.Slice(16, 16), _u1, uppercase);
+        HexCodec.Encode8(hex40Utf8.Slice(32, 8), (uint)(_u2 >> 32), uppercase);
+    }
 
-        ByteUtils.WriteHexUInt64Utf8Fixed16(hex40Utf8.Slice(0, 16), _u0, alphabet);
-        ByteUtils.WriteHexUInt64Utf8Fixed16(hex40Utf8.Slice(16, 16), _u1, alphabet);
-        ByteUtils.WriteHexUInt32Utf8Fixed8(hex40Utf8.Slice(32, 8), (uint)(_u2 >> 32), uppercase);
+    /// <summary>
+    /// Writes the EIP-55 form (<c>0x</c> + 40 mixed-case hex digits) as ASCII. The caller guarantees 42 bytes.
+    /// </summary>
+    private void WriteEvmChecksumUtf8(Span<byte> destination42)
+    {
+        destination42[0] = (byte)'0';
+        destination42[1] = (byte)'x';
+
+        Span<byte> hex = destination42.Slice(2, EvmHexLength);
+        WriteEvmHexUtf8(hex, uppercase: false);
+
+        // EIP-55 hashes the lowercase hex text, not the raw bytes.
+        Span<byte> hash = stackalloc byte[32];
+        Keccak256.ComputeHash(hex, hash);
+
+        // Digit i is upper-cased when hash nibble i (high nibble first) is >= 8. Digits 0-9 have no case.
+        for (int i = 0; i < EvmHexLength; i++)
+        {
+            byte c = hex[i];
+            if (c >= (byte)'a')
+            {
+                int nibble = (hash[i >> 1] >> ((~i & 1) << 2)) & 0x0F;
+                if (nibble >= 8)
+                    hex[i] = (byte)(c - 32);
+            }
+        }
     }
 
     private bool TryFormatEvmChecksumChars(Span<char> destination, out int charsWritten)
     {
-        // Always "0x" + 40 = 42.
         const int required = EvmHexLength + 2;
         if (destination.Length < required)
         {
@@ -633,43 +725,9 @@ public readonly struct Address :
             return false;
         }
 
-        destination[0] = '0';
-        destination[1] = 'x';
-
-        Span<char> hexLower = destination.Slice(2, EvmHexLength);
-        WriteEvmHexChars(hexLower, uppercase: false);
-
-        // Hash lowercase hex ASCII.
-        Span<byte> asciiHex = stackalloc byte[EvmHexLength];
-        for (int i = 0; i < EvmHexLength; i++)
-            asciiHex[i] = (byte)hexLower[i];
-
-        Span<byte> hash32 = stackalloc byte[32];
-        Keccak256.ComputeHash(asciiHex, hash32);
-
-        // Apply EIP-55 case rules.
-        // Convert keccak hash bytes into lowercase hex ascii to avoid byte/nibble ordering ambiguity,
-        // then use hex char >= '8' to decide uppercase for corresponding address hex digit.
-        Span<char> hashHex = stackalloc char[64]; // 32 bytes -> 64 hex chars
-        for (int j = 0; j < 32; j++)
-        {
-            byte hb = hash32[j];
-            int hi = hb >> 4;
-            int lo = hb & 0x0F;
-            hashHex[j * 2] = (char)(hi < 10 ? ('0' + hi) : ('a' + (hi - 10)));
-            hashHex[j * 2 + 1] = (char)(lo < 10 ? ('0' + lo) : ('a' + (lo - 10)));
-        }
-
-        for (int i = 0; i < EvmHexLength; i++)
-        {
-            char c = hexLower[i];
-            if ((uint)(c - 'a') <= 5u)
-            {
-                char hh = hashHex[i];
-                if (hh >= '8')
-                    hexLower[i] = (char)(c - 32);
-            }
-        }
+        Span<byte> ascii = stackalloc byte[required];
+        WriteEvmChecksumUtf8(ascii);
+        Ascii.ToUtf16(ascii, destination, out _);
 
         charsWritten = required;
         return true;
@@ -684,16 +742,7 @@ public readonly struct Address :
             return false;
         }
 
-        // Compute checksum in chars (ASCII) then copy to UTF-8.
-        Span<char> tmp = stackalloc char[required];
-        if (!TryFormatEvmChecksumChars(tmp, out int written) || written != required)
-        {
-            bytesWritten = 0;
-            return false;
-        }
-
-        for (int i = 0; i < required; i++)
-            utf8Destination[i] = (byte)tmp[i];
+        WriteEvmChecksumUtf8(utf8Destination);
 
         bytesWritten = required;
         return true;
@@ -712,17 +761,16 @@ public readonly struct Address :
         if (format.Length == 1)
         {
             char f = format[0];
-            if (f == 'x') { evmFormat = new EvmFormat(withPrefix: false, prefixUppercase: false, hexUppercase: false, kind: EvmFormatKind.Hex); return true; }
-            if (f == 'X') { evmFormat = new EvmFormat(withPrefix: false, prefixUppercase: false, hexUppercase: true, kind: EvmFormatKind.Hex); return true; }
-            if (f == 'c' || f == 'C') { evmFormat = new EvmFormat(withPrefix: true, prefixUppercase: false, hexUppercase: false, kind: EvmFormatKind.Checksum); return true; }
+            if (f == 'x') { evmFormat = new EvmFormat(withPrefix: false, hexUppercase: false, kind: EvmFormatKind.Hex); return true; }
+            if (f == 'X') { evmFormat = new EvmFormat(withPrefix: false, hexUppercase: true, kind: EvmFormatKind.Hex); return true; }
+            if (f == 'c' || f == 'C') { evmFormat = new EvmFormat(withPrefix: true, hexUppercase: false, kind: EvmFormatKind.Checksum); return true; }
         }
 
         // Two-char prefix formats.
         if (format.Length == 2 && format[0] == '0' && (format[1] == 'x' || format[1] == 'X'))
         {
-            bool prefixUpper = format[1] == 'X';
-            // Convention: "0X" implies uppercase digits.
-            evmFormat = new EvmFormat(withPrefix: true, prefixUppercase: prefixUpper, hexUppercase: prefixUpper, kind: EvmFormatKind.Hex);
+            // "0X" selects uppercase digits; the prefix is always the lowercase "0x" required by Ethereum JSON-RPC.
+            evmFormat = new EvmFormat(withPrefix: true, hexUppercase: format[1] == 'X', kind: EvmFormatKind.Hex);
             return true;
         }
 
@@ -736,12 +784,11 @@ public readonly struct Address :
         Checksum = 1
     }
 
-    private readonly struct EvmFormat(bool withPrefix, bool prefixUppercase, bool hexUppercase, Address.EvmFormatKind kind)
+    private readonly struct EvmFormat(bool withPrefix, bool hexUppercase, Address.EvmFormatKind kind)
     {
-        public static readonly EvmFormat Default = new(withPrefix: true, prefixUppercase: false, hexUppercase: false, kind: EvmFormatKind.Hex);
+        public static readonly EvmFormat Default = new(withPrefix: true, hexUppercase: false, kind: EvmFormatKind.Hex);
 
         public readonly bool WithPrefix = withPrefix;
-        public readonly bool PrefixUppercase = prefixUppercase;
         public readonly bool HexUppercase = hexUppercase;
         public readonly EvmFormatKind Kind = kind;
     }

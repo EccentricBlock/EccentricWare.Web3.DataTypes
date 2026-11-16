@@ -2,10 +2,8 @@ using EccentricWare.Web3.DataTypes.JsonConverters;
 using EccentricWare.Web3.DataTypes.Utils;
 using System.Buffers.Binary;
 using System.Diagnostics.CodeAnalysis;
-using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics;
 using System.Text.Json.Serialization;
 
 namespace EccentricWare.Web3.DataTypes;
@@ -33,9 +31,16 @@ public enum SignatureType : byte
 /// <remarks>
 /// Storage layout:
 /// - 64 bytes: signature payload (EVM: r||s, Solana: ed25519 signature)
-/// - 1 byte:  EVM recovery identifier / parity byte (meaning depends on ingestion policy)
+/// - 1 byte:  EVM recovery identifier / parity byte (meaning depends on ingestion policy); always 0 for Solana
 /// - 1 byte:  <see cref="SignatureType"/>
-/// - padding: explicit to ensure 72-byte stride in arrays (8-byte aligned per element)
+/// - 6 bytes: implicit padding, giving the 72-byte, 8-byte-aligned array stride
+///
+/// Invariant: every constructor stores <c>v == 0</c> for a Solana signature, so equality, hashing and ordering compare
+/// <c>v</c> without checking the type first.
+///
+/// Text forms: hex (with or without a 0x prefix) of 130 digits is EVM, of 128 digits is Solana (so a 64-byte
+/// EIP-2098 compact ECDSA signature reads as Solana); Base58 is Solana only and never takes a 0x prefix.
+/// Any v byte is accepted for EVM: restricting it to 0/1/27/28 or EIP-155 values is the caller's policy.
 /// </remarks>
 [StructLayout(LayoutKind.Sequential)]
 [JsonConverter(typeof(SignatureJsonConverter))]
@@ -68,10 +73,15 @@ public readonly struct Signature :
     public const int SolanaHexLength = 128;
 
     /// <summary>
-    /// Typical maximum Base58 length for a 64-byte value (Solana signatures are commonly 87–88 chars).
+    /// Typical maximum Base58 length for a 64-byte value (Solana signatures are commonly 87-88 chars).
     /// Used only as a DoS hygiene cap during parsing.
     /// </summary>
     public const int SolanaMaxBase58Length = 96;
+
+    /// <summary>
+    /// The longest Base58 text a 64-byte Solana signature encodes to (88 characters; typically 87 or 88).
+    /// </summary>
+    public const int SolanaMaxBase58EncodedLength = 88;
 
     private readonly ulong _u0; // bytes 0-7
     private readonly ulong _u1; // bytes 8-15
@@ -82,12 +92,8 @@ public readonly struct Signature :
     private readonly ulong _u6; // bytes 48-55
     private readonly ulong _u7; // bytes 56-63
 
-    private readonly byte _v;           // EVM-only: recovery identifier / parity byte
+    private readonly byte _v;           // EVM-only: recovery identifier / parity byte (0 for Solana)
     private readonly SignatureType _type;
-
-    // Explicit padding to ensure deterministic 72-byte layout and 8-byte array stride.
-    private readonly ushort _pad16;
-    private readonly uint _pad32;
 
     /// <summary>
     /// A zero signature value (defaults to <see cref="SignatureType.Evm"/> with all-zero payload).
@@ -108,8 +114,6 @@ public readonly struct Signature :
         _u4 = u4; _u5 = u5; _u6 = u6; _u7 = u7;
         _v = v;
         _type = type;
-        _pad16 = 0;
-        _pad32 = 0;
     }
 
     /// <summary>
@@ -140,7 +144,7 @@ public readonly struct Signature :
     }
 
     /// <summary>
-    /// Returns <c>true</c> if the signature payload and metadata are all zero.
+    /// Returns <c>true</c> if the signature payload and v are all zero, whatever the <see cref="Type"/>.
     /// </summary>
     public bool IsZero
     {
@@ -298,18 +302,16 @@ public readonly struct Signature :
     }
 
     /// <summary>
-    /// Checks equality by signature payload plus type, and v for EVM.
-    /// Implemented as a branch-minimal XOR/OR reduction for hot-path efficiency.
+    /// Checks equality by type, payload and v.
+    /// A single branch-free XOR/OR reduction: Solana signatures always have v == 0, so v needs no type check.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool Equals(Signature other)
     {
-        if (_type != other._type) return false;
-        if (_type == SignatureType.Evm && _v != other._v) return false;
-
         ulong diff =
             (_u0 ^ other._u0) | (_u1 ^ other._u1) | (_u2 ^ other._u2) | (_u3 ^ other._u3) |
-            (_u4 ^ other._u4) | (_u5 ^ other._u5) | (_u6 ^ other._u6) | (_u7 ^ other._u7);
+            (_u4 ^ other._u4) | (_u5 ^ other._u5) | (_u6 ^ other._u6) | (_u7 ^ other._u7) |
+            (uint)((_v ^ other._v) | ((byte)_type ^ (byte)other._type));
 
         return diff == 0;
     }
@@ -322,14 +324,18 @@ public readonly struct Signature :
     /// <summary>
     /// Computes a hash code consistent with <see cref="Equals(Signature)"/>.
     /// </summary>
+    /// <remarks>
+    /// Covers every payload byte, v and the type: a producer can choose signature bytes, so ignoring r or s would let it
+    /// fill one dictionary bucket. Each half goes through the per-process keyed <see cref="Hash256"/>, so colliding
+    /// inputs cannot be precomputed.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override int GetHashCode()
     {
-        var hc = new HashCode();
-        hc.Add(_u0); hc.Add(_u1); hc.Add(_u2); hc.Add(_u3);
-        hc.Add(_u4); hc.Add(_u5); hc.Add(_u6); hc.Add(_u7);
-        hc.Add((byte)_type);
-        hc.Add(_type == SignatureType.Evm ? _v : (byte)0);
-        return hc.ToHashCode();
+        int r = Hash256.Compute(_u0, _u1, _u2, _u3);
+        int s = Hash256.Compute(_u4, _u5, _u6, _u7);
+        int meta = (_v << 1) | (byte)_type;
+        return unchecked((r * 31 + s) * 31 + meta);
     }
 
     /// <summary>
@@ -343,7 +349,7 @@ public readonly struct Signature :
     public static bool operator !=(Signature left, Signature right) => !left.Equals(right);
 
     /// <summary>
-    /// Lexicographic comparison by type, then payload, then v for EVM.
+    /// Lexicographic comparison by type, then payload (big-endian byte order), then v.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int CompareTo(Signature other)
@@ -360,7 +366,7 @@ public readonly struct Signature :
         if (_u6 != other._u6) return _u6 < other._u6 ? -1 : 1;
         if (_u7 != other._u7) return _u7 < other._u7 ? -1 : 1;
 
-        if (_type == SignatureType.Evm && _v != other._v)
+        if (_v != other._v)
             return _v < other._v ? -1 : 1;
 
         return 0;
@@ -397,12 +403,13 @@ public readonly struct Signature :
     public static bool operator >=(Signature left, Signature right) => left.CompareTo(right) >= 0;
 
     /// <summary>
-    /// Parses a signature from a hex string (with optional 0x prefix) or a Solana Base58 signature.
+    /// Parses a signature from hex (0x prefix optional) or Solana Base58.
     /// </summary>
+    /// <exception cref="FormatException">The text is not a valid signature.</exception>
     public static Signature Parse(ReadOnlySpan<char> text)
     {
         if (!TryParse(text, out Signature value))
-            ThrowHelper.ThrowFormatExceptionInvalidSignatureHexLength();
+            ThrowHelper.ThrowFormatExceptionInvalidSignature();
 
         return value;
     }
@@ -411,111 +418,118 @@ public readonly struct Signature :
     /// Parses a signature from UTF-8 (typically a JSON string token value).
     /// Accepts 0x-prefixed hex, bare hex, or Solana Base58 for 64-byte signatures.
     /// </summary>
+    /// <exception cref="FormatException">The text is not a valid signature.</exception>
     public static Signature Parse(ReadOnlySpan<byte> utf8)
     {
         if (!TryParse(utf8, out Signature value))
-            ThrowHelper.ThrowFormatExceptionInvalidSignatureHexLength();
+            ThrowHelper.ThrowFormatExceptionInvalidSignature();
 
         return value;
     }
 
     /// <summary>
     /// Tries to parse a signature from chars without allocating.
-    /// Accepts 0x-prefixed hex, bare hex, or Solana Base58.
+    /// Accepts hex with an optional 0x prefix (130 digits: EVM, 128 digits: Solana) or Solana Base58 (no prefix).
+    /// Surrounding ASCII whitespace is ignored.
     /// </summary>
     public static bool TryParse(ReadOnlySpan<char> text, out Signature value)
-    {
-        value = Zero;
-
-        text = ByteUtils.TrimAsciiWhitespace(text);
-
-        if (text.Length >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
-            text = text.Slice(2);
-
-        // Hex fast-path (fixed widths).
-        if (text.Length == EvmHexLength)
-        {
-            if (!TryParseHexPayload64Chars(text.Slice(0, 128), out ulong u0, out ulong u1, out ulong u2, out ulong u3, out ulong u4, out ulong u5, out ulong u6, out ulong u7))
-                return false;
-
-            if (!ByteUtils.TryParseHexByteCharsFixed2(text.Slice(128, 2), out byte v))
-                return false;
-
-            value = new Signature(u0, u1, u2, u3, u4, u5, u6, u7, v, SignatureType.Evm);
-            return true;
-        }
-
-        if (text.Length == SolanaHexLength)
-        {
-            if (!TryParseHexPayload64Chars(text, out ulong u0, out ulong u1, out ulong u2, out ulong u3, out ulong u4, out ulong u5, out ulong u6, out ulong u7))
-                return false;
-
-            value = new Signature(u0, u1, u2, u3, u4, u5, u6, u7, 0, SignatureType.Solana);
-            return true;
-        }
-
-        // Solana Base58 (cold-ish, but needed for Solana JSON-RPC interoperability).
-        if (text.Length > 0 && text.Length <= SolanaMaxBase58Length)
-        {
-            Span<byte> bytes64 = stackalloc byte[SolanaByteLength];
-            if (!ByteUtils.TryDecodeBase58To64Chars(text, bytes64))
-                return false;
-
-            value = FromSolanaBytes(bytes64);
-            return true;
-        }
-
-        return false;
-    }
+        => TryParseCore(ByteUtils.TrimAsciiWhitespace(text), out value);
 
     /// <summary>
     /// Tries to parse a signature from UTF-8 without allocating.
-    /// Accepts quoted JSON string values, 0x-prefixed hex, bare hex, or Solana Base58.
+    /// Accepts quoted JSON string values, 0x-prefixed hex, bare hex, or Solana Base58 for 64-byte signatures.
     /// </summary>
     public static bool TryParse(ReadOnlySpan<byte> utf8, out Signature value)
     {
-        value = Zero;
-
         utf8 = ByteUtils.TrimAsciiWhitespaceUtf8(utf8);
         if (!ByteUtils.TryUnquoteJsonUtf8(utf8, out ReadOnlySpan<byte> token))
+        {
+            value = default;
             return false;
+        }
 
-        if (token.Length >= 2 && token[0] == (byte)'0' && ((token[1] | 0x20) == (byte)'x'))
+        return TryParseCore(token, out value);
+    }
+
+    /// <summary>
+    /// Parses the content of a JSON string token. Unlike <see cref="TryParse(ReadOnlySpan{byte}, out Signature)"/> it never
+    /// strips quote characters: inside a token they are content, not framing.
+    /// </summary>
+    internal static bool TryParseToken(ReadOnlySpan<byte> utf8, out Signature value)
+        => TryParseCore(ByteUtils.TrimAsciiWhitespaceUtf8(utf8), out value);
+
+    private static bool TryParseCore(ReadOnlySpan<char> token, out Signature value)
+    {
+        bool hasPrefix = token.Length >= 2 && token[0] == '0' && (token[1] | 0x20) == 'x';
+        if (hasPrefix)
             token = token.Slice(2);
 
-        // Hex fast-path (fixed widths).
         if (token.Length == EvmHexLength)
         {
-            if (!TryParseHexPayload64Utf8(token.Slice(0, 128), out ulong u0, out ulong u1, out ulong u2, out ulong u3, out ulong u4, out ulong u5, out ulong u6, out ulong u7))
-                return false;
-
-            if (!ByteUtils.TryParseHexByteUtf8Fixed2(token.Slice(128, 2), out byte v))
-                return false;
-
-            value = new Signature(u0, u1, u2, u3, u4, u5, u6, u7, v, SignatureType.Evm);
-            return true;
+            if (TryParseHexPayload64Chars(token.Slice(0, 128), out ulong u0, out ulong u1, out ulong u2, out ulong u3, out ulong u4, out ulong u5, out ulong u6, out ulong u7)
+                && ByteUtils.TryParseHexByteCharsFixed2(token.Slice(128, 2), out byte v))
+            {
+                value = new Signature(u0, u1, u2, u3, u4, u5, u6, u7, v, SignatureType.Evm);
+                return true;
+            }
         }
-
-        if (token.Length == SolanaHexLength)
+        else if (token.Length == SolanaHexLength)
         {
-            if (!TryParseHexPayload64Utf8(token, out ulong u0, out ulong u1, out ulong u2, out ulong u3, out ulong u4, out ulong u5, out ulong u6, out ulong u7))
-                return false;
-
-            value = new Signature(u0, u1, u2, u3, u4, u5, u6, u7, 0, SignatureType.Solana);
-            return true;
+            if (TryParseHexPayload64Chars(token, out ulong u0, out ulong u1, out ulong u2, out ulong u3, out ulong u4, out ulong u5, out ulong u6, out ulong u7))
+            {
+                value = new Signature(u0, u1, u2, u3, u4, u5, u6, u7, 0, SignatureType.Solana);
+                return true;
+            }
         }
-
-        // Solana Base58.
-        if (token.Length > 0 && token.Length <= SolanaMaxBase58Length)
+        else if (!hasPrefix && (uint)(token.Length - 1) < SolanaMaxBase58Length)
         {
-            Span<byte> bytes64 = stackalloc byte[SolanaByteLength];
-            if (!ByteUtils.TryDecodeBase58To64(token, bytes64))
-                return false;
-
-            value = FromSolanaBytes(bytes64);
-            return true;
+            // Base58 never carries a 0x prefix: "0x" means hex, so one signature has one spelling per encoding.
+            Span<ulong> limbs = stackalloc ulong[8];
+            if (Base58Decoder.TryDecode64(token, limbs))
+            {
+                value = FromBase58Limbs(limbs);
+                return true;
+            }
         }
 
+        value = default;
+        return false;
+    }
+
+    private static bool TryParseCore(ReadOnlySpan<byte> token, out Signature value)
+    {
+        bool hasPrefix = token.Length >= 2 && token[0] == (byte)'0' && (token[1] | 0x20) == (byte)'x';
+        if (hasPrefix)
+            token = token.Slice(2);
+
+        if (token.Length == EvmHexLength)
+        {
+            if (TryParseHexPayload64Utf8(token.Slice(0, 128), out ulong u0, out ulong u1, out ulong u2, out ulong u3, out ulong u4, out ulong u5, out ulong u6, out ulong u7)
+                && ByteUtils.TryParseHexByteUtf8Fixed2(token.Slice(128, 2), out byte v))
+            {
+                value = new Signature(u0, u1, u2, u3, u4, u5, u6, u7, v, SignatureType.Evm);
+                return true;
+            }
+        }
+        else if (token.Length == SolanaHexLength)
+        {
+            if (TryParseHexPayload64Utf8(token, out ulong u0, out ulong u1, out ulong u2, out ulong u3, out ulong u4, out ulong u5, out ulong u6, out ulong u7))
+            {
+                value = new Signature(u0, u1, u2, u3, u4, u5, u6, u7, 0, SignatureType.Solana);
+                return true;
+            }
+        }
+        else if (!hasPrefix && (uint)(token.Length - 1) < SolanaMaxBase58Length)
+        {
+            Span<ulong> limbs = stackalloc ulong[8];
+            if (Base58Decoder.TryDecode64(token, limbs))
+            {
+                value = FromBase58Limbs(limbs);
+                return true;
+            }
+        }
+
+        value = default;
         return false;
     }
 
@@ -525,10 +539,7 @@ public readonly struct Signature :
     /// </summary>
     public override string ToString()
     {
-        int hexLength = HexLength;
-        int totalLength = hexLength + 2;
-
-        return string.Create(totalLength, this, static (chars, sig) =>
+        return string.Create(HexLength + 2, this, static (chars, sig) =>
         {
             chars[0] = '0';
             chars[1] = 'x';
@@ -538,18 +549,17 @@ public readonly struct Signature :
 
     /// <summary>
     /// Formats to hex with optional prefix and casing.
-    /// Supported formats:
-    /// - empty / "0x" / "0X": include 0x prefix
-    /// - "x" / "X": no prefix, lowercase/uppercase
+    /// Supported formats (as for the other types in this library):
+    /// - empty / "0x": 0x prefix, lowercase digits
+    /// - "0X": 0x prefix, uppercase digits
+    /// - "x" / "X": no prefix, lowercase/uppercase digits
     /// </summary>
+    /// <exception cref="FormatException">Any other format.</exception>
     public string ToString(string? format, IFormatProvider? formatProvider = null)
     {
-        ReadOnlySpan<char> fmt = format.AsSpanSafe();
-        bool hasPrefix = fmt.Length == 0 || (fmt.Length == 2 && fmt[0] == '0' && (fmt[1] == 'x' || fmt[1] == 'X'));
-        bool uppercase = (fmt.Length == 1 && fmt[0] == 'X') || (fmt.Length == 2 && fmt[0] == '0' && fmt[1] == 'X');
+        HexFormat.Parse(format.AsSpanSafe(), out bool hasPrefix, out bool uppercase);
 
-        int hexLength = HexLength;
-        int totalLength = hasPrefix ? hexLength + 2 : hexLength;
+        int totalLength = hasPrefix ? HexLength + 2 : HexLength;
 
         return string.Create(totalLength, (this, hasPrefix, uppercase), static (chars, state) =>
         {
@@ -566,16 +576,14 @@ public readonly struct Signature :
     }
 
     /// <summary>
-    /// Tries to format to a character span.
+    /// Tries to format to a character span. Writes nothing and returns false if the destination is too small.
     /// </summary>
+    /// <exception cref="FormatException">Unknown format.</exception>
     public bool TryFormat(Span<char> destination, out int charsWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        bool hasPrefix = format.Length == 0 || (format.Length == 2 && format[0] == '0' && (format[1] == 'x' || format[1] == 'X'));
-        bool uppercase = (format.Length == 1 && format[0] == 'X') || (format.Length == 2 && format[0] == '0' && format[1] == 'X');
+        HexFormat.Parse(format, out bool hasPrefix, out bool uppercase);
 
-        int hexLength = HexLength;
-        int required = hasPrefix ? hexLength + 2 : hexLength;
-
+        int required = hasPrefix ? HexLength + 2 : HexLength;
         if (destination.Length < required)
         {
             charsWritten = 0;
@@ -596,16 +604,14 @@ public readonly struct Signature :
     }
 
     /// <summary>
-    /// Tries to format to a UTF-8 span.
+    /// Tries to format to a UTF-8 span. Writes nothing and returns false if the destination is too small.
     /// </summary>
+    /// <exception cref="FormatException">Unknown format.</exception>
     public bool TryFormat(Span<byte> utf8Destination, out int bytesWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
     {
-        bool hasPrefix = format.Length == 0 || (format.Length == 2 && format[0] == '0' && (format[1] == 'x' || format[1] == 'X'));
-        bool uppercase = (format.Length == 1 && format[0] == 'X') || (format.Length == 2 && format[0] == '0' && format[1] == 'X');
+        HexFormat.Parse(format, out bool hasPrefix, out bool uppercase);
 
-        int hexLength = HexLength;
-        int required = hasPrefix ? hexLength + 2 : hexLength;
-
+        int required = hasPrefix ? HexLength + 2 : HexLength;
         if (utf8Destination.Length < required)
         {
             bytesWritten = 0;
@@ -626,14 +632,24 @@ public readonly struct Signature :
     }
 
     /// <summary>
-    /// Parses from a string.
+    /// Parses from a string (provider is ignored; parsing is invariant).
     /// </summary>
-    public static Signature Parse(string s, IFormatProvider? provider) => Parse(s.AsSpan(), CultureInfo.InvariantCulture);
+    public static Signature Parse(string s, IFormatProvider? provider)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        return Parse(s.AsSpan(), provider);
+    }
 
     /// <summary>
     /// Parses from a span (provider is ignored; parsing is invariant).
     /// </summary>
-    public static Signature Parse(ReadOnlySpan<char> s, IFormatProvider? provider) => Parse(s, CultureInfo.InvariantCulture);
+    public static Signature Parse(ReadOnlySpan<char> s, IFormatProvider? provider)
+    {
+        if (!TryParse(s, out Signature value))
+            ThrowHelper.ThrowFormatExceptionInvalidSignature();
+
+        return value;
+    }
 
     /// <summary>
     /// Tries to parse from a string.
@@ -657,45 +673,128 @@ public readonly struct Signature :
     /// </summary>
     public static Signature ZeroSolana => new(0, 0, 0, 0, 0, 0, 0, 0, 0, SignatureType.Solana);
 
+    /// <summary>
+    /// Formats a Solana signature as canonical Base58 (the form Solana JSON-RPC and explorers use), as a string.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">This is an EVM signature; Base58 is only defined for Solana signatures.</exception>
+    public string ToBase58String()
+    {
+        Span<byte> utf8 = stackalloc byte[SolanaMaxBase58EncodedLength];
+        int written = EncodeBase58(utf8);
+        if (written < 0)
+            ThrowHelper.ThrowInvalidOperationExceptionBase58RequiresSolanaSignature();
+
+        return System.Text.Encoding.ASCII.GetString(utf8.Slice(0, written));
+    }
+
+    /// <summary>
+    /// Tries to format a Solana signature as Base58 into a character span (at most
+    /// <see cref="SolanaMaxBase58EncodedLength"/> characters). Returns false and writes nothing for an EVM signature or a
+    /// destination that is too small.
+    /// </summary>
+    public bool TryFormatBase58(Span<char> destination, out int charsWritten)
+    {
+        Span<byte> utf8 = stackalloc byte[SolanaMaxBase58EncodedLength];
+        int written = EncodeBase58(utf8);
+        if (written < 0 || destination.Length < written)
+        {
+            charsWritten = 0;
+            return false;
+        }
+
+        for (int i = 0; i < written; i++)
+            destination[i] = (char)utf8[i];
+
+        charsWritten = written;
+        return true;
+    }
+
+    /// <summary>
+    /// Tries to format a Solana signature as Base58 into a UTF-8 span (at most
+    /// <see cref="SolanaMaxBase58EncodedLength"/> bytes). Returns false and writes nothing for an EVM signature or a
+    /// destination that is too small.
+    /// </summary>
+    public bool TryFormatBase58(Span<byte> utf8Destination, out int bytesWritten)
+    {
+        int written = EncodeBase58(utf8Destination);
+        if (written < 0)
+        {
+            bytesWritten = 0;
+            return false;
+        }
+
+        bytesWritten = written;
+        return true;
+    }
+
+    /// <summary>Returns the byte count written, or -1 for an EVM signature or a destination that is too small.</summary>
+    private int EncodeBase58(Span<byte> destination)
+    {
+        if (_type != SignatureType.Solana)
+            return -1;
+
+        // Sixteen 32-bit limbs, most significant first.
+        Span<uint> limbs = stackalloc uint[16];
+        limbs[0] = (uint)(_u0 >> 32); limbs[1] = (uint)_u0;
+        limbs[2] = (uint)(_u1 >> 32); limbs[3] = (uint)_u1;
+        limbs[4] = (uint)(_u2 >> 32); limbs[5] = (uint)_u2;
+        limbs[6] = (uint)(_u3 >> 32); limbs[7] = (uint)_u3;
+        limbs[8] = (uint)(_u4 >> 32); limbs[9] = (uint)_u4;
+        limbs[10] = (uint)(_u5 >> 32); limbs[11] = (uint)_u5;
+        limbs[12] = (uint)(_u6 >> 32); limbs[13] = (uint)_u6;
+        limbs[14] = (uint)(_u7 >> 32); limbs[15] = (uint)_u7;
+
+        return Base58Encoder.Encode(limbs, destination);
+    }
+
+    /// <summary>Builds a Solana signature from 8 little-endian 64-bit limbs (limb 0 least significant).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Signature FromBase58Limbs(ReadOnlySpan<ulong> limbs)
+        => new(
+            limbs[7], limbs[6], limbs[5], limbs[4],
+            limbs[3], limbs[2], limbs[1], limbs[0],
+            0,
+            SignatureType.Solana);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void FormatHexChars(Span<char> destination, bool uppercase)
     {
-        if (destination.Length < HexLength)
-            ThrowHelper.ThrowArgumentExceptionDestinationTooSmall(nameof(destination));
-
-        // 8 * 16 chars = 128
-        ByteUtils.WriteHexUInt64CharsFixed16(destination.Slice(0, 16), _u0, uppercase);
-        ByteUtils.WriteHexUInt64CharsFixed16(destination.Slice(16, 16), _u1, uppercase);
-        ByteUtils.WriteHexUInt64CharsFixed16(destination.Slice(32, 16), _u2, uppercase);
-        ByteUtils.WriteHexUInt64CharsFixed16(destination.Slice(48, 16), _u3, uppercase);
-        ByteUtils.WriteHexUInt64CharsFixed16(destination.Slice(64, 16), _u4, uppercase);
-        ByteUtils.WriteHexUInt64CharsFixed16(destination.Slice(80, 16), _u5, uppercase);
-        ByteUtils.WriteHexUInt64CharsFixed16(destination.Slice(96, 16), _u6, uppercase);
-        ByteUtils.WriteHexUInt64CharsFixed16(destination.Slice(112, 16), _u7, uppercase);
+        // Callers have checked the length; each Slice below is bounds-checked as well.
+        HexCodec.Encode16(destination.Slice(0, 16), _u0, uppercase);
+        HexCodec.Encode16(destination.Slice(16, 16), _u1, uppercase);
+        HexCodec.Encode16(destination.Slice(32, 16), _u2, uppercase);
+        HexCodec.Encode16(destination.Slice(48, 16), _u3, uppercase);
+        HexCodec.Encode16(destination.Slice(64, 16), _u4, uppercase);
+        HexCodec.Encode16(destination.Slice(80, 16), _u5, uppercase);
+        HexCodec.Encode16(destination.Slice(96, 16), _u6, uppercase);
+        HexCodec.Encode16(destination.Slice(112, 16), _u7, uppercase);
 
         if (_type == SignatureType.Evm)
-            ByteUtils.WriteHexByteCharsFixed2(destination.Slice(128, 2), _v, uppercase);
+        {
+            ReadOnlySpan<char> alphabet = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
+            destination[128] = alphabet[_v >> 4];
+            destination[129] = alphabet[_v & 0x0F];
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void FormatHexUtf8(Span<byte> destination, bool uppercase)
     {
-        if (destination.Length < HexLength)
-            ThrowHelper.ThrowArgumentExceptionDestinationTooSmall(nameof(destination));
-
-        ReadOnlySpan<byte> alphabet = uppercase ? ByteUtils.HexBytesUpper : ByteUtils.HexBytesLower;
-
-        ByteUtils.WriteHexUInt64Utf8Fixed16(destination.Slice(0, 16), _u0, alphabet);
-        ByteUtils.WriteHexUInt64Utf8Fixed16(destination.Slice(16, 16), _u1, alphabet);
-        ByteUtils.WriteHexUInt64Utf8Fixed16(destination.Slice(32, 16), _u2, alphabet);
-        ByteUtils.WriteHexUInt64Utf8Fixed16(destination.Slice(48, 16), _u3, alphabet);
-        ByteUtils.WriteHexUInt64Utf8Fixed16(destination.Slice(64, 16), _u4, alphabet);
-        ByteUtils.WriteHexUInt64Utf8Fixed16(destination.Slice(80, 16), _u5, alphabet);
-        ByteUtils.WriteHexUInt64Utf8Fixed16(destination.Slice(96, 16), _u6, alphabet);
-        ByteUtils.WriteHexUInt64Utf8Fixed16(destination.Slice(112, 16), _u7, alphabet);
+        HexCodec.Encode16(destination.Slice(0, 16), _u0, uppercase);
+        HexCodec.Encode16(destination.Slice(16, 16), _u1, uppercase);
+        HexCodec.Encode16(destination.Slice(32, 16), _u2, uppercase);
+        HexCodec.Encode16(destination.Slice(48, 16), _u3, uppercase);
+        HexCodec.Encode16(destination.Slice(64, 16), _u4, uppercase);
+        HexCodec.Encode16(destination.Slice(80, 16), _u5, uppercase);
+        HexCodec.Encode16(destination.Slice(96, 16), _u6, uppercase);
+        HexCodec.Encode16(destination.Slice(112, 16), _u7, uppercase);
 
         if (_type == SignatureType.Evm)
-            ByteUtils.WriteHexByteUtf8Fixed2(destination.Slice(128, 2), _v, alphabet);
+        {
+            ReadOnlySpan<byte> alphabet = uppercase ? ByteUtils.HexBytesUpper : ByteUtils.HexBytesLower;
+            destination[128] = alphabet[_v >> 4];
+            destination[129] = alphabet[_v & 0x0F];
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -710,14 +809,14 @@ public readonly struct Signature :
             return false;
 
         return
-            ByteUtils.TryParseHexUInt64Utf8Fixed16(hex128.Slice(0, 16), out u0) &&
-            ByteUtils.TryParseHexUInt64Utf8Fixed16(hex128.Slice(16, 16), out u1) &&
-            ByteUtils.TryParseHexUInt64Utf8Fixed16(hex128.Slice(32, 16), out u2) &&
-            ByteUtils.TryParseHexUInt64Utf8Fixed16(hex128.Slice(48, 16), out u3) &&
-            ByteUtils.TryParseHexUInt64Utf8Fixed16(hex128.Slice(64, 16), out u4) &&
-            ByteUtils.TryParseHexUInt64Utf8Fixed16(hex128.Slice(80, 16), out u5) &&
-            ByteUtils.TryParseHexUInt64Utf8Fixed16(hex128.Slice(96, 16), out u6) &&
-            ByteUtils.TryParseHexUInt64Utf8Fixed16(hex128.Slice(112, 16), out u7);
+            HexCodec.TryDecode16(hex128.Slice(0, 16), out u0) &&
+            HexCodec.TryDecode16(hex128.Slice(16, 16), out u1) &&
+            HexCodec.TryDecode16(hex128.Slice(32, 16), out u2) &&
+            HexCodec.TryDecode16(hex128.Slice(48, 16), out u3) &&
+            HexCodec.TryDecode16(hex128.Slice(64, 16), out u4) &&
+            HexCodec.TryDecode16(hex128.Slice(80, 16), out u5) &&
+            HexCodec.TryDecode16(hex128.Slice(96, 16), out u6) &&
+            HexCodec.TryDecode16(hex128.Slice(112, 16), out u7);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -732,13 +831,13 @@ public readonly struct Signature :
             return false;
 
         return
-            ByteUtils.TryParseHexUInt64CharsFixed16(hex128.Slice(0, 16), out u0) &&
-            ByteUtils.TryParseHexUInt64CharsFixed16(hex128.Slice(16, 16), out u1) &&
-            ByteUtils.TryParseHexUInt64CharsFixed16(hex128.Slice(32, 16), out u2) &&
-            ByteUtils.TryParseHexUInt64CharsFixed16(hex128.Slice(48, 16), out u3) &&
-            ByteUtils.TryParseHexUInt64CharsFixed16(hex128.Slice(64, 16), out u4) &&
-            ByteUtils.TryParseHexUInt64CharsFixed16(hex128.Slice(80, 16), out u5) &&
-            ByteUtils.TryParseHexUInt64CharsFixed16(hex128.Slice(96, 16), out u6) &&
-            ByteUtils.TryParseHexUInt64CharsFixed16(hex128.Slice(112, 16), out u7);
+            HexCodec.TryDecode16(hex128.Slice(0, 16), out u0) &&
+            HexCodec.TryDecode16(hex128.Slice(16, 16), out u1) &&
+            HexCodec.TryDecode16(hex128.Slice(32, 16), out u2) &&
+            HexCodec.TryDecode16(hex128.Slice(48, 16), out u3) &&
+            HexCodec.TryDecode16(hex128.Slice(64, 16), out u4) &&
+            HexCodec.TryDecode16(hex128.Slice(80, 16), out u5) &&
+            HexCodec.TryDecode16(hex128.Slice(96, 16), out u6) &&
+            HexCodec.TryDecode16(hex128.Slice(112, 16), out u7);
     }
 }

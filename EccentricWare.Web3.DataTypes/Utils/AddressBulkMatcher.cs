@@ -1,46 +1,24 @@
 ﻿using System.Numerics;
 using System.Runtime.CompilerServices;
-using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
 
 namespace EccentricWare.Web3.DataTypes.Utils;
 
 /// <summary>
 /// Bulk matching utilities for <see cref="Address"/>.
-/// Provides both hash-based (compiled) membership and SIMD-assisted linear scans.
+/// Provides hash-based (compiled) membership and a linear scan for small sets.
 /// </summary>
 public static class AddressBulkMatcher
 {
     /// <summary>
-    /// Returns true if <paramref name="needle"/> is contained in <paramref name="haystack"/>.
-    /// Uses AVX2 for byte-wise equality if available, otherwise falls back to scalar limb comparison.
-    /// Intended for small arrays (dozens to a few hundred).
+    /// Returns true if <paramref name="needle"/> is contained in <paramref name="haystack"/> (same family and payload).
+    /// A plain scan. <see cref="Address"/> is 40 bytes, so a vector compare per element saved little: a benchmark taken
+    /// before the former AVX2 byte-compare was removed found it about 2.5 ns faster at 8 items, and slower than or level
+    /// with <c>Span.Contains</c> at 64, 1,024 and 65,536 items. The ISA-specific path (and its dependence on the struct
+    /// layout) was removed for that trade. Use <see cref="AddressSet"/> for more than a few hundred addresses or for
+    /// repeated lookups.
     /// </summary>
     public static bool ContainsLinear(ReadOnlySpan<Address> haystack, Address needle)
-    {
-        if (haystack.IsEmpty)
-            return false;
-
-        if (Avx2.IsSupported)
-            return ContainsLinearAvx2(haystack, needle);
-
-        // Scalar fallback: compare u0..u3 and type.
-        AddressKey.ReadKey(in needle, out ulong n0, out ulong n1, out ulong n2, out ulong n3, out byte nType);
-
-        for (int i = 0; i < haystack.Length; i++)
-        {
-            ref readonly Address candidate = ref haystack[i];
-            if ((byte)candidate.Type != nType)
-                continue;
-
-            AddressKey.ReadKey(in candidate, out ulong c0, out ulong c1, out ulong c2, out ulong c3, out _);
-
-            if (c0 == n0 && c1 == n1 && c2 == n2 && c3 == n3)
-                return true;
-        }
-
-        return false;
-    }
+        => haystack.Contains(needle);
 
     /// <summary>
     /// Writes indices of probes that are contained in <paramref name="set"/> into <paramref name="matchedProbeIndices"/>.
@@ -48,6 +26,8 @@ public static class AddressBulkMatcher
     /// </summary>
     public static int Match(AddressSet set, ReadOnlySpan<Address> probes, Span<int> matchedProbeIndices)
     {
+        ArgumentNullException.ThrowIfNull(set);
+
         if (matchedProbeIndices.Length == 0 || probes.IsEmpty)
             return 0;
 
@@ -65,65 +45,6 @@ public static class AddressBulkMatcher
 
         return written;
     }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool ContainsLinearAvx2(ReadOnlySpan<Address> haystack, Address needle)
-    {
-        AddressKey.ReadKeyBytes32(in needle, out Vector256<byte> needleBytes32, out byte needleType);
-
-        for (int i = 0; i < haystack.Length; i++)
-        {
-            ref readonly Address candidate = ref haystack[i];
-            if ((byte)candidate.Type != needleType)
-                continue;
-
-            AddressKey.ReadKeyBytes32(in candidate, out Vector256<byte> candidateBytes32, out _);
-
-            // Compare all 32 bytes.
-            Vector256<byte> eq = Avx2.CompareEqual(candidateBytes32, needleBytes32);
-            if (Avx2.MoveMask(eq) == -1)
-                return true;
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Internal key reader that relies on <see cref="Address"/> storing its 32-byte backing value in the first 32 bytes of the struct.
-    /// This matches the layout in your implementation (four ulongs first).
-    /// </summary>
-    private static class AddressKey
-    {
-        /// <summary>
-        /// Reads the key as four 64-bit limbs plus the address type byte.
-        /// Limb endianness is the in-memory representation of the struct (not big-endian wire format).
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void ReadKey(in Address address, out ulong u0, out ulong u1, out ulong u2, out ulong u3, out byte addressType)
-        {
-            // We assume Address is unmanaged and starts with four ulong fields.
-            // This is a deliberate performance trade-off for hot-path matching.
-            ref byte b = ref Unsafe.As<Address, byte>(ref Unsafe.AsRef(in address));
-
-            u0 = Unsafe.ReadUnaligned<ulong>(ref b);
-            u1 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 8));
-            u2 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 16));
-            u3 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 24));
-
-            addressType = (byte)address.Type;
-        }
-
-        /// <summary>
-        /// Reads the first 32 bytes of the key as a <see cref="Vector256{Byte}"/> (AVX2 path), plus the address type byte.
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void ReadKeyBytes32(in Address address, out Vector256<byte> keyBytes32, out byte addressType)
-        {
-            ref byte b = ref Unsafe.As<Address, byte>(ref Unsafe.AsRef(in address));
-            keyBytes32 = Unsafe.ReadUnaligned<Vector256<byte>>(ref b);
-            addressType = (byte)address.Type;
-        }
-    }
 }
 
 /// <summary>
@@ -132,26 +53,20 @@ public static class AddressBulkMatcher
 /// </summary>
 public sealed class AddressSet
 {
-    private readonly ulong[] _hashes; // 0 = empty; storedHash is always non-zero
-    private readonly ulong[] _u0;
-    private readonly ulong[] _u1;
-    private readonly ulong[] _u2;
-    private readonly ulong[] _u3;
-    private readonly byte[] _types;
+    // Hashes are probed on their own (8 per cache line) so a miss, the common case for a deny/allow list, touches one line.
+    // The key lives in one 40-byte entry rather than five parallel arrays, so a hit touches two lines instead of six.
+    private readonly ulong[] _hashes; // 0 = empty; a stored hash always has bit 63 set (see Hash)
+    private readonly Address[] _entries;
     private readonly int _mask;
     private readonly int _count;
 
     /// <summary>Returns the number of elements inserted into the set.</summary>
     public int Count => _count;
 
-    private AddressSet(ulong[] hashes, ulong[] u0, ulong[] u1, ulong[] u2, ulong[] u3, byte[] types, int count)
+    private AddressSet(ulong[] hashes, Address[] entries, int count)
     {
         _hashes = hashes;
-        _u0 = u0;
-        _u1 = u1;
-        _u2 = u2;
-        _u3 = u3;
-        _types = types;
+        _entries = entries;
         _mask = hashes.Length - 1;
         _count = count;
     }
@@ -163,55 +78,70 @@ public sealed class AddressSet
     /// <param name="loadFactor">Hash table load factor (0.50..0.90). Lower is faster but uses more memory.</param>
     public static AddressSet Build(ReadOnlySpan<Address> addresses, double loadFactor = 0.72)
     {
-        if (addresses.IsEmpty)
-            return new AddressSet(Array.Empty<ulong>(), Array.Empty<ulong>(), Array.Empty<ulong>(), Array.Empty<ulong>(), Array.Empty<ulong>(), Array.Empty<byte>(), 0);
-
-        if (loadFactor < 0.50 || loadFactor > 0.90)
+        // Written as a positive range test so NaN is rejected too (a NaN load factor would size a 4-slot table and
+        // make Build spin forever once it fills).
+        if (!(loadFactor >= 0.50 && loadFactor <= 0.90))
             throw new ArgumentOutOfRangeException(nameof(loadFactor), "Load factor must be between 0.50 and 0.90.");
 
-        int desiredCapacity = (int)Math.Ceiling(addresses.Length / loadFactor);
-        int capacity = NextPowerOfTwo(Math.Max(4, desiredCapacity));
+        if (addresses.IsEmpty)
+            return new AddressSet(Array.Empty<ulong>(), Array.Empty<Address>(), 0);
+
+        int capacity = ComputeCapacity(addresses.Length, loadFactor);
 
         var hashes = new ulong[capacity];
-        var u0 = new ulong[capacity];
-        var u1 = new ulong[capacity];
-        var u2 = new ulong[capacity];
-        var u3 = new ulong[capacity];
-        var types = new byte[capacity];
+        var entries = new Address[capacity];
 
         int inserted = 0;
 
         for (int i = 0; i < addresses.Length; i++)
         {
             ref readonly Address address = ref addresses[i];
-            ReadKey(in address, out ulong a0, out ulong a1, out ulong a2, out ulong a3, out byte t);
-
-            ulong h = Hash(a0, a1, a2, a3, t) | 1UL; // ensure non-zero
+            ulong h = Hash(in address);
             int slot = (int)h & (capacity - 1);
 
             // Linear probing.
             while (hashes[slot] != 0UL)
             {
                 // Optional de-dup: if identical, skip.
-                if (hashes[slot] == h && types[slot] == t && u0[slot] == a0 && u1[slot] == a1 && u2[slot] == a2 && u3[slot] == a3)
+                if (hashes[slot] == h && entries[slot].Equals(address))
                     goto Next;
 
                 slot = (slot + 1) & (capacity - 1);
             }
 
             hashes[slot] = h;
-            u0[slot] = a0;
-            u1[slot] = a1;
-            u2[slot] = a2;
-            u3[slot] = a3;
-            types[slot] = t;
+            entries[slot] = address;
             inserted++;
 
         Next:
             continue;
         }
 
-        return new AddressSet(hashes, u0, u1, u2, u3, types, inserted);
+        return new AddressSet(hashes, entries, inserted);
+    }
+
+    /// <summary>
+    /// Test diagnostic: how many entries have an even home slot, and the mean number of slots a successful lookup
+    /// examines. Derived from the stored hashes, so it describes the real table without duplicating the lookup loop.
+    /// </summary>
+    internal void GetPlacementStatistics(out int evenHomeSlots, out double averageProbeLength)
+    {
+        evenHomeSlots = 0;
+        long probes = 0;
+        for (int slot = 0; slot < _hashes.Length; slot++)
+        {
+            ulong stored = _hashes[slot];
+            if (stored == 0UL)
+                continue;
+
+            int home = (int)stored & _mask;
+            if ((home & 1) == 0)
+                evenHomeSlots++;
+
+            probes += ((slot - home) & _mask) + 1;
+        }
+
+        averageProbeLength = _count == 0 ? 0 : (double)probes / _count;
     }
 
     /// <summary>
@@ -223,9 +153,7 @@ public sealed class AddressSet
         if (_hashes.Length == 0)
             return false;
 
-        ReadKey(in address, out ulong a0, out ulong a1, out ulong a2, out ulong a3, out byte t);
-
-        ulong h = Hash(a0, a1, a2, a3, t) | 1UL;
+        ulong h = Hash(in address);
         int slot = (int)h & _mask;
 
         while (true)
@@ -234,57 +162,69 @@ public sealed class AddressSet
             if (stored == 0UL)
                 return false;
 
-            if (stored == h &&
-                _types[slot] == t &&
-                _u0[slot] == a0 &&
-                _u1[slot] == a1 &&
-                _u2[slot] == a2 &&
-                _u3[slot] == a3)
-            {
+            if (stored == h && _entries[slot].Equals(address))
                 return true;
-            }
 
             slot = (slot + 1) & _mask;
         }
     }
 
-    /// <summary>
-    /// Computes a stable 64-bit hash for the provided 32-byte key and type.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static ulong Hash(ulong u0, ulong u1, ulong u2, ulong u3, byte type)
-    {
-        // MurmurHash3 finaliser-style mixing; fast and stable.
-        ulong x =
-            u0 ^
-            BitOperations.RotateLeft(u1, 13) ^
-            BitOperations.RotateLeft(u2, 27) ^
-            BitOperations.RotateLeft(u3, 41) ^
-            ((ulong)type * 0x9E3779B97F4A7C15UL);
+    // Per-process random keys, one per limb (see HashSeed). The table is probed with addresses taken from transactions,
+    // and Solana account keys are arbitrary 32-byte values, so a fixed, public hash would let an attacker precompute
+    // keys that all land in one cluster and turn Build and Contains into O(n) per operation.
+    private static readonly ulong s_key0 = HashSeed.NextKey();
+    private static readonly ulong s_key1 = HashSeed.NextKey();
+    private static readonly ulong s_key2 = HashSeed.NextKey();
+    private static readonly ulong s_key3 = HashSeed.NextKey();
+    private static readonly ulong s_finalMultiplier = HashSeed.NextOddMultiplier();
 
-        x ^= x >> 33;
-        x *= 0xFF51AFD7ED558CCDUL;
-        x ^= x >> 33;
-        x *= 0xC4CEB9FE1A85EC53UL;
-        x ^= x >> 33;
-        return x;
+    /// <summary>Folded multiply: the full 128-bit product, high half xor low half.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong Mix(ulong a, ulong b)
+    {
+        ulong high = Math.BigMul(a, b, out ulong low);
+        return high ^ low;
     }
 
     /// <summary>
-    /// Reads the 32-byte backing key from <paramref name="address"/> plus its type byte.
-    /// This relies on Address storing its four ulong fields first (your current layout).
+    /// Computes a keyed, non-zero 64-bit hash (bit 63 always set) of the 32-byte key and the family. Stable only
+    /// within the process, which is all a table that is built and probed in-process needs.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ReadKey(in Address address, out ulong u0, out ulong u1, out ulong u2, out ulong u3, out byte addressType)
+    private static ulong Hash(in Address address)
     {
-        ref byte b = ref Unsafe.As<Address, byte>(ref Unsafe.AsRef(in address));
+        address.GetLimbs(out ulong u0, out ulong u1, out ulong u2, out ulong u3);
+        byte type = (byte)address.Type;
 
-        u0 = Unsafe.ReadUnaligned<ulong>(ref b);
-        u1 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 8));
-        u2 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 16));
-        u3 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 24));
+        // Two independent keyed folded multiplies. The family is added afterwards (zero for EVM): XORing it into the last limb
+        // would cancel for the Solana key whose last limb is 1 and give it the hash of the matching EVM address.
+        ulong h = Mix(u0 ^ s_key0, u1 ^ s_key1) + Mix(u2 ^ s_key2, u3 ^ s_key3) + ((ulong)type * 0x9E3779B97F4A7C15UL);
 
-        addressType = (byte)address.Type;
+        // Final avalanche so the low bits, which pick the slot, depend on every input bit.
+        h ^= h >> 32;
+        h *= s_finalMultiplier;
+        h ^= h >> 29;
+
+        // Mark non-zero with the top bit: the slot index comes from the low bits, so forcing bit 0 instead would send
+        // every first probe to an odd slot and double the effective load.
+        return h | (1UL << 63);
+    }
+
+    /// <summary>The largest table size: 2^30 slots (a power of two that still fits an array length).</summary>
+    internal const int MaxCapacity = 1 << 30;
+
+    /// <summary>
+    /// The table size for <paramref name="count"/> members at <paramref name="loadFactor"/>: the next power of two at or above
+    /// <c>count / loadFactor</c>, at least 4. Throws <see cref="ArgumentOutOfRangeException"/> when that exceeds
+    /// <see cref="MaxCapacity"/> (it used to overflow to a negative size).
+    /// </summary>
+    internal static int ComputeCapacity(int count, double loadFactor)
+    {
+        double desired = Math.Ceiling(count / loadFactor);
+        if (desired > MaxCapacity)
+            throw new ArgumentOutOfRangeException(nameof(count), $"Too many addresses for a table of at most {MaxCapacity} slots at load factor {loadFactor}.");
+
+        return NextPowerOfTwo(Math.Max(4, (int)desired));
     }
 
     /// <summary>Returns the next power-of-two greater than or equal to <paramref name="value"/>.</summary>

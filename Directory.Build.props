@@ -1,0 +1,8 @@
+<Project>
+
+  <PropertyGroup>
+    <!-- Applies to every project in the repo: library, tests and benchmarks. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+</Project>

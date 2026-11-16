@@ -1,92 +1,137 @@
+using EccentricWare.Web3.DataTypes.Utils;
 using System.Buffers;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace EccentricWare.Web3.DataTypes.JsonConverters;
 
 /// <summary>
-/// System.Text.Json converter for <see cref="EccentricWare.Web3.DataTypes.int256"/>.
+/// System.Text.Json converter for <see cref="int256"/>.
 /// Supports JSON-RPC representations:
 /// - String: "0x..." (hex) or "-123" / "123" (decimal)
 /// - Number: -123 / 123 (decimal)
-/// Writes as a JSON string:
+/// Also supports use as a dictionary key (<c>Dictionary&lt;int256, T&gt;</c>), using the string form.
+/// A JSON <c>null</c> is rejected (use <c>int256?</c> where absence matters).
+/// Writes as a JSON string using hex:
 /// - Negative values: full-width 0x-prefixed 64-hex-digit two's complement
 /// - Non-negative values: minimal 0x-prefixed hex
 /// </summary>
-public sealed class Int256JsonConverter : JsonConverter<EccentricWare.Web3.DataTypes.int256>
+public sealed class Int256JsonConverter : JsonConverter<int256>
 {
+    /// <summary>A valid decimal token is at most 78 characters; anything longer cannot parse.</summary>
+    private const int MaxNumberTokenLength = 80;
+
+    /// <summary>Longest raw escaped or split string token the slow path will copy: the longest text, all escaped, plus whitespace slack.</summary>
+    internal const int MaxRawStringTokenLength = (JsonStringTokens.MaxEscapedCharBytes * MaxNumberTokenLength) + JsonStringTokens.WhitespaceSlackBytes;
+
     /// <summary>
-    /// Reads an <see cref="EccentricWare.Web3.DataTypes.int256"/> from a JSON token (string or number).
+    /// Reads an int256 from a JSON token (string or number).
     /// </summary>
-    public override EccentricWare.Web3.DataTypes.int256 Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    public override int256 Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
-        if (reader.TokenType is JsonTokenType.String)
+        switch (reader.TokenType)
         {
-            if (!reader.ValueIsEscaped && !reader.HasValueSequence)
-            {
-                ReadOnlySpan<byte> utf8 = reader.ValueSpan;
-                if (EccentricWare.Web3.DataTypes.int256.TryParse(utf8, out var v))
-                    return v;
+            case JsonTokenType.String:
+                return ReadString(ref reader);
 
-                throw new JsonException("Invalid int256 string value.");
-            }
+            case JsonTokenType.Number:
+                return ReadNumber(ref reader);
 
-            string? s = reader.GetString();
-            if (s is null)
-                throw new JsonException("Invalid int256 string value (null).");
-
-            if (EccentricWare.Web3.DataTypes.int256.TryParse(s.AsSpan(), CultureInfo.InvariantCulture, out var v2))
-                return v2;
-
-            throw new JsonException("Invalid int256 string value.");
+            default:
+                ThrowHelper.ThrowJsonExceptionUnexpectedToken(nameof(int256), reader.TokenType, numberAllowed: true);
+                return default;
         }
-
-        if (reader.TokenType is JsonTokenType.Number)
-        {
-            ReadOnlySpan<byte> utf8 = GetRawNumberUtf8(ref reader);
-            if (EccentricWare.Web3.DataTypes.int256.TryParse(utf8, out var v))
-                return v;
-
-            throw new JsonException("Invalid int256 numeric value.");
-        }
-
-        if (reader.TokenType is JsonTokenType.Null)
-            throw new JsonException("Cannot read null into int256.");
-
-        throw new JsonException($"Unsupported JSON token for int256: {reader.TokenType}.");
     }
 
     /// <summary>
-    /// Writes an <see cref="EccentricWare.Web3.DataTypes.int256"/> as a JSON string using hex.
+    /// Reads an int256 from a JSON property name (dictionary key); same text forms as a string value.
     /// </summary>
-    public override void Write(Utf8JsonWriter writer, EccentricWare.Web3.DataTypes.int256 value, JsonSerializerOptions options)
+    public override int256 ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        => ReadString(ref reader);
+
+    /// <summary>
+    /// Writes an int256 as a JSON string using hex:
+    /// - Negative values: full-width 0x-prefixed 64-hex-digit two's complement
+    /// - Non-negative values: minimal 0x-prefixed hex
+    /// </summary>
+    public override void Write(Utf8JsonWriter writer, int256 value, JsonSerializerOptions options)
     {
-        // 0x + 64 digits for negative, or 0x + up to 64 for positive.
-        Span<char> buffer = stackalloc char[66];
-        ReadOnlySpan<char> format = "0x".AsSpan();
-
-        // For negative, int256.TryFormat emits full-width two's complement for hex formats.
-        if (!value.TryFormat(buffer, out int written, format, CultureInfo.InvariantCulture))
-            throw new JsonException("Failed to format int256.");
-
-        writer.WriteStringValue(buffer.Slice(0, written));
+        Span<byte> utf8 = stackalloc byte[66]; // "0x" + up to 64 hex digits.
+        writer.WriteStringValue(Format(value, utf8));
     }
 
     /// <summary>
-    /// Gets the raw UTF-8 bytes representing a JSON number token without allocating for the common contiguous case.
+    /// Writes an int256 as a JSON property name (dictionary key) in the same form as <see cref="Write"/>.
     /// </summary>
-    private static ReadOnlySpan<byte> GetRawNumberUtf8(ref Utf8JsonReader reader)
+    public override void WriteAsPropertyName(Utf8JsonWriter writer, int256 value, JsonSerializerOptions options)
     {
+        Span<byte> utf8 = stackalloc byte[66];
+        writer.WritePropertyName(Format(value, utf8));
+    }
+
+    private static ReadOnlySpan<byte> Format(int256 value, Span<byte> utf8)
+    {
+        // Straight to UTF-8: no char buffer and no transcoding in the writer.
+        if (!value.TryFormat(utf8, out int written, "0x", CultureInfo.InvariantCulture))
+            ThrowHelper.ThrowJsonExceptionFormatFailed(nameof(int256));
+
+        return utf8.Slice(0, written);
+    }
+
+    /// <summary>Fast path: one contiguous, unescaped span.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int256 ReadString(ref Utf8JsonReader reader)
+    {
+        if (!reader.HasValueSequence && !reader.ValueIsEscaped && int256.TryParseUnquoted(reader.ValueSpan, out int256 value))
+            return value;
+
+        return ReadStringSlow(ref reader);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int256 ReadStringSlow(ref Utf8JsonReader reader)
+    {
+        // Escaped or multi-segment tokens are rare for JSON-RPC; they take the shared slow path.
+        if (reader.HasValueSequence || reader.ValueIsEscaped)
+            return JsonStringTokens.ReadUnescaped<int256>(ref reader, int256.TryParseUnquoted, nameof(int256), MaxRawStringTokenLength);
+
+        ThrowHelper.ThrowJsonExceptionInvalidValue(nameof(int256));
+        return default;
+    }
+
+    private static int256 ReadNumber(ref Utf8JsonReader reader)
+    {
+        // Numbers are exposed as raw UTF-8 digits in ValueSpan/ValueSequence.
         if (!reader.HasValueSequence)
-            return reader.ValueSpan;
+        {
+            if (int256.TryParseUnquoted(reader.ValueSpan, out int256 value))
+                return value;
+        }
+        else if (TryParseNumberSequence(reader.ValueSequence, out int256 sequenceValue))
+        {
+            return sequenceValue;
+        }
 
-        ReadOnlySequence<byte> seq = reader.ValueSequence;
-        if (seq.Length <= 0 || seq.Length > 100)
-            throw new JsonException("int256 numeric token length is invalid.");
+        ThrowHelper.ThrowJsonExceptionInvalidValue(nameof(int256));
+        return default;
+    }
 
-        byte[] tmpReturn = new byte[(int)seq.Length];
-        seq.CopyTo(tmpReturn);
-        return tmpReturn;
+    /// <summary>
+    /// Parses a JSON number token that spans buffer segments, copying it to the stack (never the heap).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool TryParseNumberSequence(ReadOnlySequence<byte> sequence, out int256 value)
+    {
+        if (sequence.Length <= 0 || sequence.Length > MaxNumberTokenLength)
+        {
+            value = default;
+            return false;
+        }
+
+        Span<byte> utf8 = stackalloc byte[MaxNumberTokenLength];
+        sequence.CopyTo(utf8);
+        return int256.TryParseUnquoted(utf8.Slice(0, (int)sequence.Length), out value);
     }
 }

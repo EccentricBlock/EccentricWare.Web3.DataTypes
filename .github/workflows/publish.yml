@@ -22,6 +22,7 @@ jobs:
       CONFIGURATION: Release
       DOTNET_VERSION: 10.0.x
       PROJECT_PATH: ./EccentricWare.Web3.DataTypes/EccentricWare.Web3.DataTypes.csproj
+      TEST_PROJECT_PATH: ./Eccentricware.Web3.DataTypes.Test/Eccentricware.Web3.DataTypes.Test.csproj
       PACKAGE_OUTPUT: artifacts/package/release
       NUGET_SOURCE: https://api.nuget.org/v3/index.json
 
@@ -55,9 +56,18 @@ jobs:
       - name: Build
         run: dotnet build ${{ env.PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-restore
 
+      # The Build step above builds only the library, so the test project is restored and built here (no --no-build): with
+      # --no-build `dotnet test` fails because the test assembly was never produced.
       - name: Test (optional)
-        run: dotnet test -c ${{ env.CONFIGURATION }} --no-build
+        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }}
         # If you don't have tests or don't want them gating publishing, remove this step.
+
+      # UInt256BulkSimd dispatches on Avx2.IsSupported with no in-process seam, so its public scalar fallback only runs when
+      # AVX2 is off. This second pass covers those lines (and checks nothing else assumes AVX2).
+      - name: Test with AVX2 disabled (scalar fallbacks)
+        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-restore
+        env:
+          DOTNET_EnableAVX2: "0"
 
       - name: Pack
         shell: pwsh
