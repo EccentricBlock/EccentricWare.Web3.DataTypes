@@ -5,6 +5,8 @@ using System.Globalization;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Text;
 using System.Text.Json.Serialization;
 using EccentricWare.Web3.DataTypes.JsonConverters;
@@ -499,6 +501,9 @@ public readonly struct int256 :
         if (shift < 0) throw new ArgumentOutOfRangeException(nameof(shift), "Shift count must be non-negative.");
         if (shift >= 256) return Zero;
 
+        if (Avx2.IsSupported)
+            return Unsafe.BitCast<Vector256<ulong>, int256>(UInt256Simd.ShiftLeft(Vector256.Create(value._u0, value._u1, value._u2, value._u3), shift));
+
         int wholeLimbs = shift >> 6;
         int bitShift = shift & 63;
 
@@ -556,6 +561,9 @@ public readonly struct int256 :
 
         if (shift >= 256)
             return value.IsNegative ? MinusOne : Zero;
+
+        if (Avx2.IsSupported)
+            return Unsafe.BitCast<Vector256<ulong>, int256>(UInt256Simd.ShiftRightArithmetic(Vector256.Create(value._u0, value._u1, value._u2, value._u3), shift));
 
         int wholeLimbs = shift >> 6;
         int bitShift = shift & 63;
