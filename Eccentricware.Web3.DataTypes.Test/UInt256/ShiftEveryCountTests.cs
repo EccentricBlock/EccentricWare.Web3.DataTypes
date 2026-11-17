@@ -3,9 +3,9 @@ using System.Numerics;
 namespace EccentricWare.Web3.DataTypes.Tests;
 
 /// <summary>
-/// Every shift count against a BigInteger oracle, for operands that put bits on both sides of every limb boundary. The
-/// shift operators take a vector path where AVX2 exists and a scalar path elsewhere (the CI scalar-fallback job disables
-/// AVX2), so the same assertions pin both: any carry, whole-limb move or sign-fill error shows up as a mismatch.
+/// Every shift count against a BigInteger oracle, for operands that put bits on both sides of every limb boundary. The shift
+/// operators read neighbouring limbs at an offset computed from the count, so an indexing, carry or sign-fill error shows up as
+/// a mismatch at some count and limb pairing; sparse random limbs and a single bit at every position cover both.
 /// </summary>
 [TestClass]
 public sealed class ShiftEveryCountTests
