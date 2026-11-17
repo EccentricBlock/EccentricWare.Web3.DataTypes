@@ -47,6 +47,10 @@ public sealed class ThrowHelperTests
             "Invalid signature: expected hex with an optional 0x prefix (130 digits for EVM, 128 for Solana) or Solana Base58 without a prefix"),
         (nameof(ThrowHelper.ThrowInvalidOperationExceptionBase58RequiresSolanaSignature), [], typeof(InvalidOperationException), null,
             "Base58 is only defined for Solana signatures; this is an EVM signature."),
+        (nameof(ThrowHelper.ThrowInvalidOperationExceptionRlpEnumeratorNoCurrent), [], typeof(InvalidOperationException), null,
+            "RLPChildEnumerator.Current is only valid after MoveNext() returned true and before the next MoveNext() returns false."),
+        (nameof(ThrowHelper.ThrowInvalidOperationExceptionRlpDocumentModified), [], typeof(InvalidOperationException), null,
+            "The RLP document no longer matches what was validated: its bytes were modified after TryDecodeComplete."),
     ];
 
     // Helpers verified by dedicated tests below instead of a Contracts row.

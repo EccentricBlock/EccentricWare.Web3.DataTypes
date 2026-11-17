@@ -28,7 +28,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+        os:
+          - ubuntu-latest
+          # Hosted arm64 Linux runners are free only for public repositories. In a private repository this entry has no
+          # runner available and its job queues indefinitely, so remove it (or use a self-hosted arm64 runner) there.
+          - ubuntu-24.04-arm
+          - windows-latest
+          - macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -45,8 +51,53 @@ jobs:
       - name: Build
         run: dotnet build ${{ env.SOLUTION_PATH }} -c ${{ env.CONFIGURATION }} --no-restore
 
+      # TRX results and Cobertura coverage (coverlet.collector, referenced by the test project) go to TestResults and are uploaded below.
       - name: Test
-        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build
+        run: >
+          dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build
+          --logger "trx;LogFileName=test-results.trx"
+          --collect "XPlat Code Coverage"
+          --results-directory TestResults
+
+      # Bash on every OS (Git Bash on Windows). Records what the results were produced on, and the version of the RLP fuzz corpus
+      # (file count and a SHA-256 over the sorted file names and contents, CR removed so a CRLF checkout on Windows hashes the same).
+      - name: Record environment and fuzz corpus version
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p TestResults
+          corpus="${{ env.TEST_PROJECT_PATH }}/Rlp/Fuzz/Corpus"
+          sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+          {
+            echo "== runner"
+            echo "matrix.os: ${{ matrix.os }}"
+            echo "RUNNER_OS=$RUNNER_OS RUNNER_ARCH=$RUNNER_ARCH"
+            echo "== uname"
+            uname -a || true
+            echo "== cpu"
+            case "$RUNNER_OS" in
+              Linux) lscpu 2>/dev/null || grep -m1 'model name' /proc/cpuinfo || true ;;
+              macOS) sysctl -n machdep.cpu.brand_string || true; sysctl -n hw.ncpu || true ;;
+              Windows) echo "PROCESSOR_IDENTIFIER=$PROCESSOR_IDENTIFIER"; echo "NUMBER_OF_PROCESSORS=$NUMBER_OF_PROCESSORS"; systeminfo 2>/dev/null | head -n 30 || true ;;
+            esac
+            echo "== dotnet --info"
+            dotnet --info
+            echo "== fuzz corpus"
+            count=$(cd "$corpus" && find . -maxdepth 1 -type f -name '*.hex' | wc -l | tr -d ' ')
+            digest=$(cd "$corpus" && find . -maxdepth 1 -type f -name '*.hex' | LC_ALL=C sort | while read -r f; do printf '%s\n' "$f"; tr -d '\r' < "$f"; done | sha256)
+            echo "corpus: $corpus"
+            echo "files: $count"
+            echo "sha256 over sorted names and contents: $digest"
+          } > TestResults/environment.txt 2>&1
+          cat TestResults/environment.txt
+
+      - name: Upload test results, coverage and environment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: TestResults/**
+          if-no-files-found: warn
 
   # UInt256BulkSimd dispatches on Avx2.IsSupported with no in-process seam, so its public scalar fallback only runs when
   # AVX2 is off (the same second pass publish.yml makes before packing). Linux x64 only: the variable has no effect on arm64.
@@ -72,3 +123,31 @@ jobs:
         run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build
         env:
           DOTNET_EnableAVX2: "0"
+
+  # Compiles the LIBRARY with C# overflow checking on (RlpCheckedArithmetic switch in Directory.Build.props; tests and benchmarks stay
+  # unchecked) and runs the RLP tests, so a narrowing cast or int overflow that is not marked unchecked(...) fails the job. The switch
+  # only takes effect when the library is compiled: the build step uses --no-incremental and the test step uses --no-build on that
+  # same output. RLP_EXPECT_CHECKED_BUILD=1 makes CheckedArithmeticBuildGuardTests fail if the library was not built checked.
+  # Scope: the RLP codec (the filter). Other library types have deliberate wraps that are not marked unchecked(...) yet.
+  checked-arithmetic:
+    name: checked-arithmetic (RLP, overflow checking on)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore ${{ env.TEST_PROJECT_PATH }}
+
+      - name: Build library with overflow checking
+        run: dotnet build ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-restore --no-incremental -p:RlpCheckedArithmetic=true
+
+      - name: Test RLP with overflow checking
+        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build -p:RlpCheckedArithmetic=true --filter "FullyQualifiedName~Rlp"
+        env:
+          RLP_EXPECT_CHECKED_BUILD: "1"

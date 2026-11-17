@@ -194,4 +194,14 @@ internal static class ThrowHelper
     public static void ThrowInvalidOperationExceptionBase58RequiresSolanaSignature()
         => throw new InvalidOperationException("Base58 is only defined for Solana signatures; this is an EVM signature.");
 
+    // RLP exceptions (programming-contract violations only; malformed input is reported through RLPStatus)
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static void ThrowInvalidOperationExceptionRlpEnumeratorNoCurrent()
+        => throw new InvalidOperationException("RLPChildEnumerator.Current is only valid after MoveNext() returned true and before the next MoveNext() returns false.");
+
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static void ThrowInvalidOperationExceptionRlpDocumentModified()
+        => throw new InvalidOperationException("The RLP document no longer matches what was validated: its bytes were modified after TryDecodeComplete.");
 }

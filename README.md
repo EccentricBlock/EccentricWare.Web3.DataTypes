@@ -25,6 +25,7 @@ This library provides **native C# value types** for common EVM and Solana primit
 - `Signature`
 - `HexBigInteger`
 - `uint256`, `int256`
+- RLP reader and writer (`EccentricWare.Web3.DataTypes.Rlp`, see [RLP](#rlp))
 
 All types are immutable, thread-safe, and optimised for high-throughput pipelines.
 
@@ -163,6 +164,46 @@ var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 options.Converters.Add(new AddressJsonConverter());
 options.Converters.Add(new UInt256JsonConverter());
 ```
+
+---
+
+## RLP
+
+A strict, canonical, allocation-free RLP reader and writer in `EccentricWare.Web3.DataTypes.Rlp`, with adapters for `uint256`, `Address`, `Hash32`, `FunctionSelector` and `Signature`. Every `Try*` member returns an `RLPStatus`; malformed input never throws and never reads out of bounds. Deny on any status other than `Success`.
+
+```csharp
+using EccentricWare.Web3.DataTypes.Rlp;
+
+// Read: validates the whole document once, then traversal is free.
+RLPStatus status = RLPData.TryDecodeComplete(bytes, RLPDecodeLimits.Default, out RLPData root, out RLPError error);
+if (status == RLPStatus.Success && root.TryGetChildren(out RLPChildEnumerator children) == RLPStatus.Success)
+{
+    while (children.MoveNext())
+    {
+        children.Current.TryGetUInt256(out uint256 value);   // canonical integers only
+    }
+}
+
+// Write: announce each list's exact children length, then write the children.
+Span<byte> buffer = stackalloc byte[128];
+Span<int> frames = stackalloc int[4];                        // maximum list depth
+var writer = new RLPWriter(buffer, frames);
+writer.TryBeginList(22);                                     // 1-byte integer + 21-byte address
+writer.TryWriteUInt64(1);
+writer.TryWriteAddress(address);
+writer.TryEndList();
+writer.TryComplete(out int written);                         // buffer[..written]
+```
+
+Things to know before using it:
+
+- **Keep input bytes stable.** A validated view is trusted only while the buffer it was validated against is unchanged and not written concurrently.
+- **Limits are your policy.** `RLPDecodeLimits.Default` is 1 MiB, depth 32, 8,192 items: a starting point for one transaction from an untrusted peer. It rejects some valid data (very large access lists, network-form blob transactions with 8 or more blobs, block bodies), so size the limits to what you decode.
+- **Index workspaces are yours.** `TryIndexDirectChildren` fills a caller `Span<RLPRange>`; do not share or recycle it while the index is in use.
+- **Writes are atomic.** A failed write changes no byte and no writer state. Pass `RLPWriter` by `ref` and never copy it.
+- **Schema is yours.** The codec checks structure, not field counts, EIP-2718 type bytes or signatures. `TryGetEvmLegacySignature` returns the EIP-155 chain id from `v` (any chain id up to `ulong.MaxValue`) and the y parity in `Signature.V`; check the chain id against the one you serve.
+
+Details (links are absolute so they also work from the NuGet package page): [API](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/rlp-api.md), [wire format](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/rlp-wire-format.md), [security](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/rlp-security.md), [EVM integration](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/rlp-integration.md), [performance](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/rlp-performance.md).
 
 ---
 

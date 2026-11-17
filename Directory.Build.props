@@ -5,4 +5,20 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <!--
+      Opt-in checked arithmetic for the LIBRARY only (never the tests or benchmarks): the compiler emits add.ovf, sub.ovf and
+      conv.ovf, so any int, long or uint overflow or narrowing cast that is not wrapped in unchecked(...) throws OverflowException.
+      Used to prove the RLP codec has no hidden overflow; deliberate wraps are marked unchecked(...) in the source.
+      Usage (the checked-arithmetic job in .github/workflows/ci.yml does exactly this): compile with the switch and a forced
+      rebuild (the dotnet build "no-incremental" option), then run the tests on that build:
+        dotnet build Eccentricware.Web3.DataTypes.Test -c Release -p:RlpCheckedArithmetic=true [no-incremental option]
+        dotnet test Eccentricware.Web3.DataTypes.Test -c Release -p:RlpCheckedArithmetic=true [no-build option] [filter FullyQualifiedName~Rlp]
+      The property only matters when the library is COMPILED. Force a rebuild (or delete obj and bin) whenever you switch between
+      checked and unchecked, otherwise stale binaries are reused and the run proves nothing. Setting RLP_EXPECT_CHECKED_BUILD=1 makes
+      CheckedArithmeticBuildGuardTests fail when the library was not compiled checked.
+    -->
+    <CheckForOverflowUnderflow Condition="'$(RlpCheckedArithmetic)'=='true' And '$(MSBuildProjectName)'=='EccentricWare.Web3.DataTypes'">true</CheckForOverflowUnderflow>
+  </PropertyGroup>
+
 </Project>

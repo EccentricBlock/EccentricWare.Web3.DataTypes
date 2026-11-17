@@ -1,0 +1,17 @@
+# Minimum corpus size per category; RlpFuzzCorpusReplayTests fails when a category or the total drops below these numbers.
+# Adding files passes. Regenerate after adding files (see README.md, 'Adding a corpus file'). Do not lower a number to hide a deletion.
+ambiguous- 18
+canonical- 308
+divergence- 18
+evm- 24
+hostile- 644
+integer- 33
+invalid- 133
+invalid-nested- 251
+known-ethereum- 27
+limit- 94
+list-one-byte-child- 256
+signature- 35
+single-byte- 256
+spec-12-2- 13
+TOTAL 2110

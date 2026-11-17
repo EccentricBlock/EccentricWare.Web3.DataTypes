@@ -17,6 +17,8 @@
 
   <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
+    <!-- Comparison baseline for the RLP suites (RlpComparisonBenchmarks); never referenced by the library. The test project references it too, for NethereumDifferentialTests. -->
+    <PackageReference Include="Nethereum.RLP" Version="7.1.0" />
   </ItemGroup>
 
   <ItemGroup>

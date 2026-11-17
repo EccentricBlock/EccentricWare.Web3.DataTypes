@@ -25,6 +25,27 @@ baseline before and after a change, so regressions and improvements are measured
 | `Int256Benchmarks` | The same areas for `int256`: sign-aware compare, checked arithmetic, multiply/divide/modulo (native sign-magnitude, with `BigInteger_*` reference rows), negative hex (two's complement) and signed decimal parsing/formatting, JSON, EF Core value converter |
 | `Int256CollectionBenchmarks` | `Dictionary` lookups (random and signed-sequential keys, default vs `Int256Comparer`) and sorting with mixed signs |
 | `HexBigIntegerBenchmarks` | Construction, equality/ordering/hashing, hex parsing (chars and UTF-8; tiny block-number, 64-bit, 256-bit, negative, quoted and 2,048-bit values), `ToString`, UTF-8 and char formatting (hex and decimal), JSON converter (hex strings, number tokens, property names), EF Core value converter, `BigInteger_*` reference rows |
+| `RlpDecodeBenchmarks` | `RLPData.TryDecodeComplete` of the signed legacy transaction (9 fields) and an EIP-1559 payload with access list, `TryGetUInt64` (2 and 8 bytes) |
+| `RlpDecodeStringBenchmarks` | Strict decode of one string: empty `80`, a literal byte, 55, 56, 300 and 70,000 bytes |
+| `RlpDecodeNestedBenchmarks` | Strict decode of nested lists at depth 1 / 4 / 16 / 32 |
+| `RlpDecodeWideBenchmarks` | Strict decode of a flat list of 1 / 9 / 64 / 1,024 short strings |
+| `RlpDecodeCopyBenchmarks` | `TryCopyEncodedTo` of a 9-byte, 180-byte and 1,027-byte item |
+| `RlpEnumerationBenchmarks` | `RLPChildEnumerator` pass over 64 children (ns per child) for literal, 4-byte, 32-byte, 300-byte, mixed and list children |
+| `RlpEnumerationWalkBenchmarks` | Recursive walk of every item of the legacy transaction, the EIP-1559 payload and nested lists |
+| `RlpIndexBenchmarks` | `TryIndexDirectChildren` for 9 / 12 / 16 fields into a `stackalloc` workspace, the counting pass alone (`IndexCapacityExceeded`) to size the second pass, and a build into a workspace with one slot per payload byte |
+| `RlpIndexLookupBenchmarks` | `RLPChildrenIndex.TryGetAt` against an enumerator scan to the first, middle and last of 12 fields |
+| `RlpEncoderStringBenchmarks` | `RLPEncoder` sizing and `TryWriteByteString` / `TryWriteUnsignedMagnitude` for 0 / 1 / 55 / 56 / 255 / 256 bytes, a root `RLPWriter` session, the single-byte literal |
+| `RlpEncoderUInt64Benchmarks` | `RLPEncoder.TryWriteUInt64` for 0, 1, 127, 128 and `ulong.MaxValue` |
+| `RlpEncoderListBenchmarks` | `TryGetListLength`, and framed `RLPWriter` sessions building the legacy transaction, the EIP-1559 payload and a 32-deep nested list (cross-checked against the EIP-155 example transaction). `Writer_*` rows pass a precomputed list length; the `*_WithSizing` rows first compute every list length from the field values with the public sizing helpers, as a real caller must |
+| `RlpHostileInputBenchmarks` | Strict decode of hostile and boundary inputs: too large, overflowing lengths (`bb ff*4`, `bf ff*8`), truncated, non-canonical, depth at the limit and one past, items at the limit and one past |
+| `RlpTypedAdapterReadBenchmarks` | `TryGetUInt256` (2 bytes, 8 bytes, 32 bytes), `TryGetAddress`, `TryGetHash32`, `TryGetFunctionSelector`, `TryGetEvmYParitySignature` |
+| `RlpTypedAdapterWriteBenchmarks` | `TryWriteUInt256` (2 bytes, 8 bytes, 32 bytes), `TryWriteAddress`, `TryWriteHash32`, `TryWriteEvmYParity` inside a framed writer |
+| `RlpEvmLegacySignatureReadBenchmarks` | `TryGetEvmLegacySignature` for no chain id (v = 27) and chain ids 1, 137, 98866 and `ulong.MaxValue` (a 9-byte `v`) |
+| `RlpEvmLegacyVWriteBenchmarks` | `TryWriteEvmLegacyV` for the same five cases inside a framed writer |
+| `RlpSizingBenchmarks` | `RLPEncoder.GetUInt64EncodedLength`, `TryGetUnsignedMagnitudeLength`, `RLPTypedExtensions.GetUInt256EncodedLength`, `TryGetEvmLegacyVEncodedLength` over 64 distinct values per width class |
+| `RlpEndToEndBenchmarks` | Decode, locate fields (index or one enumerator pass), read every field with the typed adapters, Keccak-256 the encoding; `Hash_Only_Legacy` and `Legacy_Decode_Only` as reference rows |
+| `RlpConcurrentThroughputRunner` (not BenchmarkDotNet) | `--rlp-concurrency`: mixed-workload ops/s, p50/p95/p99/p99.9/max latency and GC under 1 to N threads; see below |
+| `RlpComparisonBenchmarks` | The same workloads against `Nethereum.RLP` 7.1.0 (a `PackageReference` of the benchmark and test projects, never of the library). Not a like-for-like strictness comparison; see `docs/rlp-performance.md` |
 
 Inputs are generated from fixed seeds (`BenchmarkData`), and each suite verifies in `[GlobalSetup]` that its parse
 inputs round-trip, so a wrong benchmark fails loudly instead of reporting a fast no-op.
@@ -80,6 +101,42 @@ wrong values for hex above 2^255 and for 4,096-digit output).
 
 For a 256-bit-only baseline, use the filter `"*UInt256*" "*Int256*"` and a folder such as
 `BenchmarkDotNet.Artifacts/baseline-256bit` (that folder is git-ignored, so it survives branch switches).
+
+For an RLP-only baseline, use the filter `"*Rlp*"` (158 benchmark cases; the default job took about 47 minutes for the 130 cases that existed at the first recording, and 34 minutes for 86 of the 158, so run it in the
+background; add `--job short` for a quicker look) and a folder such as `BenchmarkDotNet.Artifacts/rlp-baseline`:
+
+```bash
+dotnet build -c Release EccentricWare.Web3.DataTypes.Benchmarks
+dotnet EccentricWare.Web3.DataTypes.Benchmarks/bin/Release/net10.0/EccentricWare.Web3.DataTypes.Benchmarks.dll \
+  --filter "*Rlp*" --exporters json github --artifacts BenchmarkDotNet.Artifacts/rlp-baseline
+```
+
+Single RLP suites are selected by class name, for example `--filter "*RlpEncoderListBenchmarks*"` or `--filter "*RlpDecode*"` (all decode classes).
+The `RlpDecodeWideBenchmarks`, `RlpDecodeNestedBenchmarks` and similar classes carry one `[Params]` aspect each so the parameter sets are not multiplied.
+Rows that exercise a `ref struct` accessor (`TryGetUInt64`, `TryGetUInt256`, `TryIndexDirectChildren`, `TryCopyEncodedTo`, typed writers) repeat the
+accessor 64 or 1,024 times per invocation with `OperationsPerInvoke`, because a `RLPData` cannot be stored in a field: the figure is per
+repetition, with the one decode (or writer set-up) amortised into it. The measured RLP baselines and the tuning record are in
+`docs/rlp-performance.md`; the raw results stay in the git-ignored `BenchmarkDotNet.Artifacts/rlp-baseline` and `.../rlp-after` folders.
+`RlpComparisonBenchmarks` needs the restored `Nethereum.RLP` package (the only package this project adds beyond BenchmarkDotNet; the test project references it as well, for its differential tests); its rows are
+labelled `Ours_*` and `Nethereum_*` and grouped by category.
+
+### Concurrent throughput harness
+
+Spec 13.1 asks for ops/s and p50/p95/p99 under a mixed workload with stable owned input; BenchmarkDotNet reports means only, so this is a
+stand-alone loop in `RlpConcurrentThroughputRunner.cs`, started from `Program.cs` before `BenchmarkSwitcher`:
+
+```bash
+dotnet build -c Release EccentricWare.Web3.DataTypes.Benchmarks
+dotnet EccentricWare.Web3.DataTypes.Benchmarks/bin/Release/net10.0/EccentricWare.Web3.DataTypes.Benchmarks.dll \
+  --rlp-concurrency [--threads 1,2,4,8,12] [--seconds 10] [--warmup 3] [--out <dir>]
+```
+
+Defaults: threads 1, 2, 4, 8 and the logical core count; 3 s warm-up and 10 s measured per run (about 2 minutes in total, including an untimed
+reference run per thread count and a 1-thread burn-in). Output is Markdown on stdout plus `rlp-concurrency.md`, `rlp-concurrency.csv` and
+`rlp-concurrency-ops.csv` in `<dir>` (default `BenchmarkDotNet.Artifacts/rlp-concurrency/<timestamp>/`, git-ignored). The operation mix (percentages),
+the environment block, the timer overhead and the caveats (closed loop, unpinned threads, one run per thread count) are part of the output. Every
+operation result is verified on every call; a wrong result aborts the run with the operation name and exit code 2. Close other CPU-heavy work first; do not
+run it together with a BenchmarkDotNet session.
 
 Compare only runs from the same machine, power plan, and .NET runtime. Results are not portable and are
 intentionally not committed.

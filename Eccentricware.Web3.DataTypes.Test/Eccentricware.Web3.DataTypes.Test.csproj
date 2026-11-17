@@ -15,6 +15,18 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.12.0" />
     <!-- A real provider, so converter behaviour (stored bytes, ORDER BY, range filters, equality) is tested end to end. -->
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.15" />
+    <!-- Independent Ethereum RLP implementation for the differential tests (spec 12.4); test-only, never referenced by the library. -->
+    <PackageReference Include="Nethereum.RLP" Version="7.1.0" />
+    <!-- Cobertura line coverage for CI (the XPlat Code Coverage data collector of dotnet test); a collector only, never referenced by the library. -->
+    <PackageReference Include="coverlet.collector" Version="10.1.1">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Persistent fuzz corpus (one .hex file per case), replayed by RlpFuzzCorpusReplayTests from the output folder. -->
+    <None Update="Rlp\Fuzz\Corpus\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
