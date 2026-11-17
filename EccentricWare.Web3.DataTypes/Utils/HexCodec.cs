@@ -127,11 +127,11 @@ internal static class HexCodec
     // ---------------------------------------------------------------- encode
 
     /// <summary>
-    /// Expands the 8 nibbles of <paramref name="value"/> into 8 ASCII hex digits packed in a <see cref="ulong"/>
-    /// whose least-significant byte is the first (most significant) digit, i.e. little-endian memory order.
+    /// Spreads the 8 nibbles of <paramref name="value"/> into the 8 bytes of a <see cref="ulong"/>, most significant nibble
+    /// in the least significant byte (so little-endian memory order is the order the digits are written in).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static ulong ToAsciiDigits(uint value, bool uppercase)
+    internal static ulong SpreadNibblesMostSignificantFirst(uint value)
     {
         // Spread nibble k of the value into byte k.
         ulong x = value;
@@ -140,7 +140,17 @@ internal static class HexCodec
         x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0FUL;
 
         // Most significant nibble first.
-        x = BinaryPrimitives.ReverseEndianness(x);
+        return BinaryPrimitives.ReverseEndianness(x);
+    }
+
+    /// <summary>
+    /// Expands the 8 nibbles of <paramref name="value"/> into 8 ASCII hex digits packed in a <see cref="ulong"/>
+    /// whose least-significant byte is the first (most significant) digit, i.e. little-endian memory order.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong ToAsciiDigits(uint value, bool uppercase)
+    {
+        ulong x = SpreadNibblesMostSignificantFirst(value);
 
         // '0' + n, plus 'a' - '0' - 10 (0x27) or 'A' - '0' - 10 (0x07) where n >= 10 (n + 6 sets bit 4 exactly then).
         ulong ge10 = ((x + 0x0606060606060606UL) >> 4) & 0x0101010101010101UL;

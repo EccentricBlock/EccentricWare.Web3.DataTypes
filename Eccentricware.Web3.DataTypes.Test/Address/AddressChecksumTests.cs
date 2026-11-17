@@ -45,6 +45,58 @@ public sealed class AddressChecksumTests
         AssertAllEntryPointsProduce(Address.FromEvmBytes(Convert.FromHexString(lower)), expected);
     }
 
+    // The branch-free case fold must equal the plain per-digit rule on every input: digit i is upper-cased when it is a letter and
+    // hash nibble i (high nibble first) is >= 8. Random addresses exercise every letter/nibble combination; the structured ones
+    // cover all-digit, all-letter, single-bit and boundary values.
+    [TestMethod]
+    public void Checksum_MatchesThePerDigitReferenceRule_ForRandomAndStructuredAddresses()
+    {
+        var rng = new Random(55);
+        var bytes = new byte[Address.EvmByteLength];
+        int checkedCount = 0;
+
+        void Check(byte[] raw)
+        {
+            string lower = Convert.ToHexStringLower(raw);
+            Assert.AreEqual("0x" + ReferenceChecksum(lower), Address.FromEvmBytes(raw).ToChecksumString(), lower);
+            checkedCount++;
+        }
+
+        for (int i = 0; i < 20_000; i++)
+        {
+            rng.NextBytes(bytes);
+            Check(bytes);
+        }
+
+        Check(new byte[Address.EvmByteLength]);
+        Check(Enumerable.Repeat((byte)0xFF, Address.EvmByteLength).ToArray());
+        Check(Enumerable.Repeat((byte)0xAB, Address.EvmByteLength).ToArray());
+        Check(Enumerable.Repeat((byte)0x99, Address.EvmByteLength).ToArray());
+        for (int bit = 0; bit < Address.EvmByteLength * 8; bit++)
+        {
+            var single = new byte[Address.EvmByteLength];
+            single[bit >> 3] = (byte)(0x80 >> (bit & 7));
+            Check(single);
+        }
+
+        Assert.IsTrue(checkedCount >= 20_000 + 4 + 160);
+    }
+
+    private static string ReferenceChecksum(string lowerHex40)
+    {
+        byte[] hash = new byte[32];
+        Keccak256.ComputeHash(Encoding.ASCII.GetBytes(lowerHex40), hash);
+        var chars = lowerHex40.ToCharArray();
+        for (int i = 0; i < chars.Length; i++)
+        {
+            int nibble = (hash[i >> 1] >> ((i & 1) == 0 ? 4 : 0)) & 0x0F;
+            if (chars[i] >= 'a' && nibble >= 8)
+                chars[i] = char.ToUpperInvariant(chars[i]);
+        }
+
+        return new string(chars);
+    }
+
     private static void AssertAllEntryPointsProduce(Address a, string expected)
     {
         Assert.AreEqual(expected, a.ToChecksumString());
