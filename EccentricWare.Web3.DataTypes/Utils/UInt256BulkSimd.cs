@@ -75,92 +75,32 @@ public static class UInt256BulkSimd
 
     #region AVX2 Implementations
 
+    // The three methods keep their names and signatures: the tests bind to them by reflection to run the AVX2 and scalar
+    // implementations side by side. The scan itself is shared with Hash32 (see ItemScan32).
+
     /// <summary>
     /// AVX2 implementation of IndexOf for uint256 values.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int IndexOfAvx2(ReadOnlySpan<uint256> haystack, in uint256 needle)
-    {
-        Vector256<ulong> needleVec = ReadUInt256AsVector(in needle);
-
-        ref EccentricWare.Web3.DataTypes.uint256 start = ref MemoryMarshal.GetReference(haystack);
-        int length = haystack.Length;
-
-        int i = 0;
-
-        // Unroll by 2 to reduce loop overhead.
-        int lastUnrolled = length - 2;
-        for (; i <= lastUnrolled; i += 2)
-        {
-            if (EqualsAvx2(ReadUInt256AsVectorWithRef(ref Unsafe.Add(ref start, i)), needleVec))
-                return i;
-
-            if (EqualsAvx2(ReadUInt256AsVectorWithRef(ref Unsafe.Add(ref start, i + 1)), needleVec))
-                return i + 1;
-        }
-
-        for (; i < length; i++)
-        {
-            if (EqualsAvx2(ReadUInt256AsVectorWithRef(ref Unsafe.Add(ref start, i)), needleVec))
-                return i;
-        }
-
-        return -1;
-    }
+        => ItemScan32.IndexOf(ref AsBytes(haystack), haystack.Length, ReadUInt256AsVector(in needle));
 
     /// <summary>
     /// AVX2 implementation of CountEquals for uint256 values.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int CountEqualsAvx2(ReadOnlySpan<uint256> haystack, in uint256 needle)
-    {
-        Vector256<ulong> needleVec = ReadUInt256AsVector(in needle);
-
-        ref uint256 start = ref MemoryMarshal.GetReference(haystack);
-        int length = haystack.Length;
-
-        int count = 0;
-        int i = 0;
-
-        int lastUnrolled = length - 4;
-        for (; i <= lastUnrolled; i += 4)
-        {
-            count += EqualsAvx2(ReadUInt256AsVectorWithRef(ref Unsafe.Add(ref start, i + 0)), needleVec) ? 1 : 0;
-            count += EqualsAvx2(ReadUInt256AsVectorWithRef(ref Unsafe.Add(ref start, i + 1)), needleVec) ? 1 : 0;
-            count += EqualsAvx2(ReadUInt256AsVectorWithRef(ref Unsafe.Add(ref start, i + 2)), needleVec) ? 1 : 0;
-            count += EqualsAvx2(ReadUInt256AsVectorWithRef(ref Unsafe.Add(ref start, i + 3)), needleVec) ? 1 : 0;
-        }
-
-        for (; i < length; i++)
-            count += EqualsAvx2(ReadUInt256AsVectorWithRef(ref Unsafe.Add(ref start, i)), needleVec) ? 1 : 0;
-
-        return count;
-    }
+        => ItemScan32.CountEquals(ref AsBytes(haystack), haystack.Length, ReadUInt256AsVector(in needle));
 
     /// <summary>
     /// AVX2 implementation of FindAllEquals for uint256 values.
     /// </summary>
     private static int FindAllEqualsAvx2(ReadOnlySpan<uint256> haystack, in uint256 needle, Span<int> destinationIndices)
-    {
-        Vector256<ulong> needleVec = ReadUInt256AsVector(in needle);
+        => ItemScan32.FindAll(ref AsBytes(haystack), haystack.Length, ReadUInt256AsVector(in needle), destinationIndices);
 
-        ref uint256 start = ref MemoryMarshal.GetReference(haystack);
-        int length = haystack.Length;
-
-        int written = 0;
-
-        for (int i = 0; i < length; i++)
-        {
-            if (EqualsAvx2(ReadUInt256AsVectorWithRef(ref Unsafe.Add(ref start, i)), needleVec))
-            {
-                destinationIndices[written++] = i;
-                if (written == destinationIndices.Length)
-                    break;
-            }
-        }
-
-        return written;
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ref byte AsBytes(ReadOnlySpan<uint256> haystack)
+        => ref Unsafe.As<uint256, byte>(ref MemoryMarshal.GetReference(haystack));
 
     /// <summary>
     /// Loads a uint256 value as a <see cref="Vector256{UInt64}"/> using an unaligned read.
@@ -170,28 +110,6 @@ public static class UInt256BulkSimd
     {
         ref byte src = ref Unsafe.As<uint256, byte>(ref Unsafe.AsRef(in value));
         return Unsafe.ReadUnaligned<Vector256<ulong>>(ref src);
-    }
-
-    /// <summary>
-    /// Loads a uint256 value as a <see cref="Vector256{UInt64}"/> using an unaligned read.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector256<ulong> ReadUInt256AsVectorWithRef(ref uint256 value)
-    {
-        ref byte src = ref Unsafe.As<uint256, byte>(ref value);
-        return Unsafe.ReadUnaligned<Vector256<ulong>>(ref src);
-    }
-
-    /// <summary>
-    /// Returns true if two <see cref="Vector256{UInt64}"/> values are equal across all 32 bytes using AVX2.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool EqualsAvx2(Vector256<ulong> left, Vector256<ulong> right)
-    {
-        Vector256<ulong> cmp = Avx2.CompareEqual(left, right);
-
-        // If all bytes are 0xFF then MoveMask returns 0xFFFFFFFF (-1).
-        return Avx2.MoveMask(cmp.AsByte()) == -1;
     }
 
     #endregion

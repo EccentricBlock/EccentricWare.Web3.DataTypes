@@ -7,6 +7,7 @@ using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Text.Json.Serialization;
 
 namespace EccentricWare.Web3.DataTypes;
@@ -649,6 +650,13 @@ public readonly struct Hash32 :
     {
         if (haystack.IsEmpty) return -1;
 
+        // First-limb filter over four items at a time (see ItemScan32); hashes make accidental first-limb matches negligible.
+        if (Avx2.IsSupported && haystack.Length >= 8)
+        {
+            return ItemScan32.IndexOf(ref Unsafe.As<Hash32, byte>(ref MemoryMarshal.GetReference(haystack)), haystack.Length,
+                Vector256.Create(needle._u0, needle._u1, needle._u2, needle._u3));
+        }
+
         // SIMD pays off when scanning many items; we still keep a safe fallback.
         if (Vector256.IsHardwareAccelerated && haystack.Length >= 8)
         {
@@ -686,6 +694,12 @@ public readonly struct Hash32 :
         if (haystack.IsEmpty) return 0;
 
         int countMatches = 0;
+
+        if (Avx2.IsSupported && haystack.Length >= 8)
+        {
+            return ItemScan32.CountEquals(ref Unsafe.As<Hash32, byte>(ref MemoryMarshal.GetReference(haystack)), haystack.Length,
+                Vector256.Create(needle._u0, needle._u1, needle._u2, needle._u3));
+        }
 
         if (Vector256.IsHardwareAccelerated && haystack.Length >= 8)
         {
