@@ -767,9 +767,13 @@ public readonly struct Signature :
         WriteBytes(raw);
         ReadOnlySpan<byte> bytes = raw.Slice(0, ByteLength);
 
-        _ = uppercase
+        bool written = uppercase
             ? Convert.TryToHexString(bytes, destination, out _)
             : Convert.TryToHexStringLower(bytes, destination, out _);
+
+        // Callers check the length first; keep the failure loud (as the bounds-checked slices did) if one ever does not.
+        if (!written)
+            ThrowHelper.ThrowArgumentExceptionDestinationTooSmall(nameof(destination));
     }
 
     private void FormatHexUtf8(Span<byte> destination, bool uppercase)
@@ -778,8 +782,12 @@ public readonly struct Signature :
         WriteBytes(raw);
         ReadOnlySpan<byte> bytes = raw.Slice(0, ByteLength);
 
-        _ = uppercase
+        bool written = uppercase
             ? Convert.TryToHexString(bytes, destination, out _)
             : Convert.TryToHexStringLower(bytes, destination, out _);
+
+        // Callers check the length first; keep the failure loud (as the bounds-checked slices did) if one ever does not.
+        if (!written)
+            ThrowHelper.ThrowArgumentExceptionDestinationTooSmall(nameof(destination));
     }
 }

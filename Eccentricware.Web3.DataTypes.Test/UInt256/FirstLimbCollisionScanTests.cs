@@ -91,6 +91,72 @@ public sealed class FirstLimbCollisionScanTests
         }
     }
 
+    // A scan reads four items per step, so a bound that is off by one reads the item just past the span. Every other test uses an
+    // exact-length array, where that item does not exist; here it does, and it is the needle.
+    [TestMethod]
+    public void UInt256_Slice_NeedlesJustBeforeAndAfterTheSpan_AreNeverSeen()
+    {
+        foreach (UInt256BulkImplementation impl in UInt256BulkSimdImplementations.Supported())
+        {
+            foreach (bool colliding in new[] { false, true })
+            {
+                foreach (int start in Enumerable.Range(0, 5))
+                {
+                    foreach (int length in Enumerable.Range(1, 40))
+                    {
+                        uint256[] whole = Enumerable.Range(0, start + length + 9)
+                            .Select(i => colliding ? Colliding(i) : new uint256((ulong)(i + 1), (ulong)(i + 2), (ulong)(i + 3), (ulong)(i + 4)))
+                            .ToArray();
+                        if (start > 0)
+                            whole[start - 1] = Needle;
+                        for (int k = 0; k < 9; k++)
+                            whole[start + length + k] = Needle;
+
+                        ReadOnlySpan<uint256> slice = whole.AsSpan(start, length);
+                        string context = $"{impl.Name} colliding={colliding} start {start} length {length}";
+
+                        Assert.AreEqual(-1, impl.IndexOf(slice, in Needle), context + " IndexOf");
+                        Assert.AreEqual(0, impl.CountEquals(slice, in Needle), context + " CountEquals");
+                        Assert.AreEqual(0, impl.FindAllEquals(slice, in Needle, new int[length + 12]), context + " FindAll");
+
+                        // Positive control: the same slice does report a needle planted at its own last position.
+                        whole[start + length - 1] = Needle;
+                        Assert.AreEqual(length - 1, impl.IndexOf(whole.AsSpan(start, length), in Needle), context + " control");
+                    }
+                }
+            }
+        }
+    }
+
+    [TestMethod]
+    public void Hash32_Slice_NeedlesJustBeforeAndAfterTheSpan_AreNeverSeen()
+    {
+        foreach (bool colliding in new[] { false, true })
+        {
+            foreach (int start in Enumerable.Range(0, 5))
+            {
+                foreach (int length in Enumerable.Range(1, 40))
+                {
+                    Hash32[] whole = Enumerable.Range(0, start + length + 9)
+                        .Select(i => colliding ? CollidingHash(i) : new Hash32((ulong)(i + 1), (ulong)(i + 2), (ulong)(i + 3), (ulong)(i + 4)))
+                        .ToArray();
+                    if (start > 0)
+                        whole[start - 1] = HashNeedle;
+                    for (int k = 0; k < 9; k++)
+                        whole[start + length + k] = HashNeedle;
+
+                    string context = $"colliding={colliding} start {start} length {length}";
+                    Assert.AreEqual(-1, Hash32.IndexOf(whole.AsSpan(start, length), HashNeedle), context + " IndexOf");
+                    Assert.AreEqual(0, Hash32.CountEquals(whole.AsSpan(start, length), HashNeedle), context + " CountEquals");
+
+                    whole[start + length - 1] = HashNeedle;
+                    Assert.AreEqual(length - 1, Hash32.IndexOf(whole.AsSpan(start, length), HashNeedle), context + " control");
+                    Assert.AreEqual(1, Hash32.CountEquals(whole.AsSpan(start, length), HashNeedle), context + " control count");
+                }
+            }
+        }
+    }
+
     [TestMethod]
     public void UInt256_NeedleWhoseFirstLimbOnlyAppearsInOtherLimbs_IsNotMatched()
     {

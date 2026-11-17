@@ -245,8 +245,10 @@ Intel Core Ultra 9 185H, .NET 10.0.15 (RyuJIT x86-64-v3), BenchmarkDotNet 0.15.8
 | `Signature` JSON read, Solana Base58 | 2.74 µs | 122 ns |
 | `Signature.GetHashCode` | 14.1 ns | 1.9 ns |
 | `Signature` `Dictionary` hit (per 1,024 keys) | 19.5 µs | 9.1 µs |
-| `Signature.TryFormat` to UTF-8 hex | 41 ns | 28 ns |
+| `Signature.TryFormat` to UTF-8 hex (see note) | 41 ns | 9 ns |
 | `ByteUtils.TryDecodeBase58To32` | 747 ns | 36 ns |
+
+Note: the two hex rows were re-measured after `Signature` moved to the BCL's hex codecs, with an out-of-process BenchmarkDotNet job (5 warm-up, 10 measured iterations) on the same machine, not with the `--inProcess --job short` configuration above; the hex format row's "Before" is the figure from that earlier configuration (a direct A/B of the two implementations under the newer job gave 24 ns before and 9 ns after).
 
 Other figures worth knowing (current code, no allocation unless noted):
 
@@ -254,7 +256,7 @@ Other figures worth knowing (current code, no allocation unless noted):
 | --- | ---: |
 | `Hash32.TryParseBase58` (32-byte Base58) | 40 ns |
 | `Address.TryParse`, Solana Base58 (UTF-8) | 41 ns |
-| `Signature.TryParse`, EVM hex (UTF-8) | 29 ns |
+| `Signature.TryParse`, EVM hex (UTF-8) (see note) | 16 ns |
 | `Signature.TryFormatBase58` (Solana, UTF-8) | 176 ns |
 | `Address.TryFormat`, Solana Base58 (UTF-8) | 58 ns |
 | `Signature` equality / ordering | 1.4 ns |
