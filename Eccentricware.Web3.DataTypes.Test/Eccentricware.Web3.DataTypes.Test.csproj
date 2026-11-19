@@ -17,6 +17,12 @@
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.15" />
     <!-- Independent Ethereum RLP implementation for the differential tests (spec 12.4); test-only, never referenced by the library. -->
     <PackageReference Include="Nethereum.RLP" Version="7.1.0" />
+    <!-- Independent typed-transaction encoders (legacy, EIP-2930, EIP-1559, EIP-4844, EIP-7702) for the ABI RLP-adapter sample tests; test-only, never referenced by the library. -->
+    <PackageReference Include="Nethereum.Model" Version="7.1.0" />
+    <!-- Independent Solidity ABI implementation for the ABI differential tests (ABI spec 10.4); test-only, never referenced by the library. -->
+    <PackageReference Include="Nethereum.ABI" Version="7.1.0" />
+    <!-- Independent secp256k1 recovery and EIP-7702 authorization signing (Authorisation7702Signer) for the EIP-7702 tests; test-only, never referenced by the library. -->
+    <PackageReference Include="Nethereum.Signer" Version="7.1.0" />
     <!-- Cobertura line coverage for CI (the XPlat Code Coverage data collector of dotnet test); a collector only, never referenced by the library. -->
     <PackageReference Include="coverlet.collector" Version="10.1.1">
       <PrivateAssets>all</PrivateAssets>
@@ -27,6 +33,8 @@
   <ItemGroup>
     <!-- Persistent fuzz corpus (one .hex file per case), replayed by RlpFuzzCorpusReplayTests from the output folder. -->
     <None Update="Rlp\Fuzz\Corpus\**" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Persistent ABI fuzz corpus, replayed by ABIFuzzCorpusReplayTests from the output folder. -->
+    <None Update="ABI\Fuzz\Corpus\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

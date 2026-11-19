@@ -19,10 +19,19 @@
     <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
     <!-- Comparison baseline for the RLP suites (RlpComparisonBenchmarks); never referenced by the library. The test project references it too, for NethereumDifferentialTests. -->
     <PackageReference Include="Nethereum.RLP" Version="7.1.0" />
+    <!-- Comparison baseline for the ABI suites (AbiComparisonBenchmarks); never referenced by the library. The test project references it too, for ABINethereumDifferentialTests. -->
+    <PackageReference Include="Nethereum.ABI" Version="7.1.0" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\EccentricWare.Web3.DataTypes\EccentricWare.Web3.DataTypes.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Two independent, allocating, recursive ABI reference encoders from the test project build the ABI benchmark inputs and verify them in
+         [GlobalSetup] (the counterpart of RlpReferenceNode). They are compiled in, not referenced, so the benchmarks do not depend on the test assembly. -->
+    <Compile Include="..\Eccentricware.Web3.DataTypes.Test\ABI\ABIReferenceModel.cs" Link="Abi\ABIReferenceModel.cs" />
+    <Compile Include="..\Eccentricware.Web3.DataTypes.Test\ABI\ABIIndependentEncoder.cs" Link="Abi\ABIIndependentEncoder.cs" />
   </ItemGroup>
 
 </Project>

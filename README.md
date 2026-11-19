@@ -26,6 +26,7 @@ This library provides **native C# value types** for common EVM and Solana primit
 - `HexBigInteger`
 - `uint256`, `int256`
 - RLP reader and writer (`EccentricWare.Web3.DataTypes.Rlp`, see [RLP](#rlp))
+- ABI codec (`EccentricWare.Web3.DataTypes.ABI`, see [ABI](#abi))
 
 All types are immutable, thread-safe, and optimised for high-throughput pipelines.
 
@@ -204,6 +205,60 @@ Things to know before using it:
 - **Schema is yours.** The codec checks structure, not field counts, EIP-2718 type bytes or signatures. `TryGetEvmLegacySignature` returns the EIP-155 chain id from `v` (any chain id up to `ulong.MaxValue`) and the y parity in `Signature.V`; check the chain id against the one you serve.
 
 Details (links are absolute so they also work from the NuGet package page): [API](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/rlp-api.md), [wire format](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/rlp-wire-format.md), [security](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/rlp-security.md), [EVM integration](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/rlp-integration.md), [performance](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/rlp-performance.md).
+
+---
+
+## ABI
+
+A strict, canonical, allocation-free Solidity ABI codec in `EccentricWare.Web3.DataTypes.ABI`: compile a trusted schema once, validate a whole call or argument document against it, read fields in place, and encode canonical documents into caller buffers. Every decode, read and write `Try*` member returns `bool` plus an `ABIStatus` (the schema compile and parse members return an `ABISchemaError`, whose `Status` is an `ABIStatus`); malformed input never throws and never reads out of bounds. Deny on any status other than `Success`.
+
+```csharp
+using EccentricWare.Web3.DataTypes;
+using EccentricWare.Web3.DataTypes.ABI;
+
+// Bootstrap (allocates): the selector is computed from the canonical signature, never supplied.
+var compileLimits = ABICompileLimits.Default;
+ABISchemaCompiler.TryCompileFunctionSignature("transfer(address,uint256)", in compileLimits, out ABIFunctionSchema? transfer, out _);
+
+// Inputs for the example: calldata is the untrusted call bytes; the other two are the values to encode.
+ReadOnlySpan<byte> calldata = default;
+Address recipientAddress = default;
+uint256 amountToSend = uint256.Zero;
+
+// Decode: validates the whole call once (selector, offsets, padding, trailing bytes), then reads fields in place.
+var limits = ABIDecodeLimits.Default;
+if (ABICallData.TryDecode(calldata, transfer!, in limits, out ABICallData call, out ABIStatus status)
+    && call.Arguments.TryGetAddress([0], out Address recipient, out status)
+    && call.Arguments.TryGetUInt256([1], out uint256 amount, out status))
+{
+    // recipient and amount are values; nothing was allocated. An ERC-20 amount is a uint256: do NOT read it with
+    // TryGetUInt64, because approve(spender, type(uint256).max) and a transfer of 1e20 wei both exceed 64 bits.
+}
+
+// Encode: caller-owned destination and scratch; publish buffer[..written] only after TryFinish succeeds.
+Span<byte> buffer = stackalloc byte[68];
+Span<ABIWriteFrame> frames = stackalloc ABIWriteFrame[2];
+var encodeLimits = ABIEncodeLimits.Default;
+if (ABICallEncoder.TryBegin(transfer!, buffer, frames, in encodeLimits, out ABICallEncoder encoder, out status)
+    && encoder.TryWriteAddress(recipientAddress, out status) && encoder.TryWriteUInt256(amountToSend, out status)
+    && encoder.TryFinish(out int written, out status))
+{
+    // buffer[..written]: selector + arguments, 68 bytes
+}
+```
+
+`TryGetUInt256`, `TryWriteAddress(Address)` and the other typed members are extension methods in `ABITypedExtensions` over `uint256`, `int256`, `Address`, `Hash32` and `FunctionSelector`; they add no rules of their own (every status and budget is that of the span member they call). The span members (`TryGetUInt256Word`, `TryGetAddress(.., out ReadOnlySpan<byte>, ..)`, `TryWriteAddress(ReadOnlySpan<byte>, ..)`) remain the primitive API. Note that `uint256` arithmetic and the implicit `int`/`long` to `uint256` conversions throw in the caller's expression, before the codec runs.
+
+Things to know before using it:
+
+- **It is strict on purpose.** Only the canonical layout Solidity encoders emit is accepted. Layouts the Solidity decoder tolerates (gaps, overlapping tails, trailing bytes, dirty padding) are rejected, so a call the contract would execute can be refused. There is no permissive fallback.
+- **Structure is not authorisation.** Decoding proves bytes match a schema you supplied. It does not prove the contract, the function behind a selector (selectors collide), what a `bytes` argument does, or that signing is safe. Resolve the schema from trusted metadata, treat `bytes` as opaque unless verified metadata says otherwise, and bind approvals to a digest of the exact bytes.
+- **Keep input bytes stable.** A validated view is trusted only while the buffer is unchanged; the codec does not detect mutation.
+- **Limits are your policy.** `ABIDecodeLimits.Default` is 256 KiB, depth 16, 4,096 array elements, 16,384 values, 100,000 work units; zero-width values are bounded only by the value and work budgets.
+- **Writers are atomic per operation and monotonic on failure.** The first failure faults the writer for good and the buffer then holds no valid document.
+- **EVM adapters are included, policy is not.** `EccentricWare.Web3.DataTypes.ABI.EvmAdapters` reads transaction envelopes (`RLPCalldataAdapter`), binds selectors to trusted functions by chain, contract and verified code identity (`ContractFunctionResolver`), follows only declared nested calls such as `multicall` children (`NestedCallWalker`), failing closed, and applies EIP-7702 authorization lists so calls to delegated accounts resolve by the delegate's code (`EvmAuthorizationProcessor`). Code identities, registry contents and the allow or deny decision are yours (`docs/abi-integration.md`).
+
+Details (links are absolute so they also work from the NuGet package page): [API](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/abi-api.md), [wire format](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/abi-wire-format.md), [security](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/abi-security.md), [RLP and signing-policy integration](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/abi-integration.md), [conformance matrix](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/abi-conformance.md), [performance](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/abi-performance.md), [design notes](https://github.com/EccentricBlock/Eccentricware.Web3.DataTypes/blob/main/docs/abi-design-notes.md) (the numbered decisions where the specification is open or self-contradictory).
 
 ---
 
