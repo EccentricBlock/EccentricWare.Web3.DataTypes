@@ -53,6 +53,28 @@ public sealed class CheckedArithmeticBuildGuardTests
         Assert.AreEqual(int.MinValue, wrapped, "an unchecked build wraps int.MaxValue + 1 to int.MinValue");
     }
 
+    /// <summary>
+    /// Regression: <c>Hash256.Compute</c> wraps by design, and before it was marked <c>unchecked</c> every hash of these types threw
+    /// <see cref="OverflowException"/> in the checked build, so dictionaries keyed by them failed. With random per-process keys the
+    /// keyed sum and the final multiply overflow for essentially every input, so several keys make a missed throw impossible in practice.
+    /// </summary>
+    [TestMethod]
+    public void HashesOfTheLimbTypes_DoNotThrow_InEitherArithmeticContext()
+    {
+        byte[] allOnes = [.. Enumerable.Repeat((byte)0xff, 32)];
+        var uints = new HashSet<uint256> { uint256.Zero, uint256.One, uint256.MaxValue, new(0x0123_4567_89ab_cdefUL, ulong.MaxValue, 1UL, 0x8000_0000_0000_0000UL) };
+        var ints = new HashSet<int256> { int256.MinValue, int256.MaxValue, int256.MinusOne, int256.Zero };
+        var hashes = new HashSet<Hash32> { Hash32.Zero, new(allOnes), new(ulong.MaxValue, 0UL, ulong.MaxValue, 0UL) };
+        var addresses = new HashSet<Address> { Address.ZeroEvm, Address.FromEvmBytes(allOnes.AsSpan(0, 20)), Address.ZeroSolana };
+
+        Assert.AreEqual(4, uints.Count);
+        Assert.AreEqual(4, ints.Count);
+        Assert.AreEqual(3, hashes.Count);
+        Assert.AreEqual(3, addresses.Count);
+        Assert.IsTrue(uints.Contains(uint256.MaxValue) && ints.Contains(int256.MinValue) && hashes.Contains(new Hash32(allOnes))
+            && addresses.Contains(Address.FromEvmBytes(allOnes.AsSpan(0, 20))));
+    }
+
     [TestMethod]
     public void TheProbe_DoesNotThrow_ForOrdinaryValues()
     {

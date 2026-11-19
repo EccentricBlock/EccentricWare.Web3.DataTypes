@@ -54,7 +54,7 @@ jobs:
       # TRX results and Cobertura coverage (coverlet.collector, referenced by the test project) go to TestResults and are uploaded below.
       - name: Test
         run: >
-          dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build
+          dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build --blame-hang-timeout 10m
           --logger "trx;LogFileName=test-results.trx"
           --collect "XPlat Code Coverage"
           --results-directory TestResults
@@ -88,6 +88,13 @@ jobs:
             echo "corpus: $corpus"
             echo "files: $count"
             echo "sha256 over sorted names and contents: $digest"
+            abicorpus="${{ env.TEST_PROJECT_PATH }}/ABI/Fuzz/Corpus"
+            abicount=$(cd "$abicorpus" && find . -maxdepth 1 -type f -name '*.hex' | wc -l | tr -d ' ')
+            abidigest=$(cd "$abicorpus" && find . -maxdepth 1 -type f -name '*.hex' | LC_ALL=C sort | while read -r f; do printf '%s\n' "$f"; tr -d '\r' < "$f"; done | sha256)
+            echo "== abi fuzz regression corpus (inputs found by a fuzzer or reviewer; the generated seeds are produced in memory by the tests)"
+            echo "corpus: $abicorpus"
+            echo "files: $abicount"
+            echo "sha256 over sorted names and contents: $abidigest"
           } > TestResults/environment.txt 2>&1
           cat TestResults/environment.txt
 
@@ -120,17 +127,25 @@ jobs:
         run: dotnet build ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-restore
 
       - name: Test with AVX2 disabled
-        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build
+        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build --blame-hang-timeout 10m
         env:
           DOTNET_EnableAVX2: "0"
+
+      # No hardware intrinsics at all: Vector128 and Vector256 are not accelerated either, so the ABI run and padding dispatchers take their
+      # scalar reference branch (a mutant that breaks that branch survives every other job).
+      - name: Test with hardware intrinsics disabled
+        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build --blame-hang-timeout 10m
+        env:
+          DOTNET_EnableHWIntrinsic: "0"
 
   # Compiles the LIBRARY with C# overflow checking on (RlpCheckedArithmetic switch in Directory.Build.props; tests and benchmarks stay
   # unchecked) and runs the RLP tests, so a narrowing cast or int overflow that is not marked unchecked(...) fails the job. The switch
   # only takes effect when the library is compiled: the build step uses --no-incremental and the test step uses --no-build on that
   # same output. RLP_EXPECT_CHECKED_BUILD=1 makes CheckedArithmeticBuildGuardTests fail if the library was not built checked.
-  # Scope: the RLP codec (the filter). Other library types have deliberate wraps that are not marked unchecked(...) yet.
+  # Scope: the RLP codec and the ABI codec (the two filters; "Tests.ABI", not "ABI", which would also match an unrelated Address test that is not
+  # checked-clean). Other library types have deliberate wraps that are not marked unchecked(...) yet.
   checked-arithmetic:
-    name: checked-arithmetic (RLP, overflow checking on)
+    name: checked-arithmetic (RLP and ABI, overflow checking on)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -148,6 +163,11 @@ jobs:
         run: dotnet build ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-restore --no-incremental -p:RlpCheckedArithmetic=true
 
       - name: Test RLP with overflow checking
-        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build -p:RlpCheckedArithmetic=true --filter "FullyQualifiedName~Rlp"
+        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build --blame-hang-timeout 10m -p:RlpCheckedArithmetic=true --filter "FullyQualifiedName~Rlp"
+        env:
+          RLP_EXPECT_CHECKED_BUILD: "1"
+
+      - name: Test ABI with overflow checking
+        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build --blame-hang-timeout 10m -p:RlpCheckedArithmetic=true --filter "FullyQualifiedName~Tests.ABI|FullyQualifiedName~CheckedArithmeticBuildGuardTests"
         env:
           RLP_EXPECT_CHECKED_BUILD: "1"
