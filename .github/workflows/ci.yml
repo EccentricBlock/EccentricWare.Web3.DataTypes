@@ -54,7 +54,7 @@ jobs:
       # TRX results and Cobertura coverage (coverlet.collector, referenced by the test project) go to TestResults and are uploaded below.
       - name: Test
         run: >
-          dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build
+          dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build --blame-hang-timeout 10m
           --logger "trx;LogFileName=test-results.trx"
           --collect "XPlat Code Coverage"
           --results-directory TestResults
@@ -120,7 +120,7 @@ jobs:
         run: dotnet build ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-restore
 
       - name: Test with AVX2 disabled
-        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build
+        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build --blame-hang-timeout 10m
         env:
           DOTNET_EnableAVX2: "0"
 
@@ -148,6 +148,6 @@ jobs:
         run: dotnet build ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-restore --no-incremental -p:RlpCheckedArithmetic=true
 
       - name: Test RLP with overflow checking
-        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build -p:RlpCheckedArithmetic=true --filter "FullyQualifiedName~Rlp"
+        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c ${{ env.CONFIGURATION }} --no-build --blame-hang-timeout 10m -p:RlpCheckedArithmetic=true --filter "FullyQualifiedName~Rlp"
         env:
           RLP_EXPECT_CHECKED_BUILD: "1"
